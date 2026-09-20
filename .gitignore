@@ -1,0 +1,21 @@
+# Data files (large, runtime-generated)
+data/*.jsonl
+data/*.json
+data/*.csv
+!data/.gitkeep
+
+# Dependencies
+node_modules/
+
+# Environment secrets
+.env
+*.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Debug
+dbg*.cjs
+debug.js

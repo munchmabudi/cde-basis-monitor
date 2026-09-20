@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Perp Spread & Funding Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0d1117; color:#e6edf3; font-family:'Segoe UI',system-ui,sans-serif; padding:20px; }
+  h1   { font-size:1.2rem; color:#58a6ff; margin-bottom:4px; }
+  .subtitle { font-size:0.8rem; color:#8b949e; margin-bottom:16px; }
+
+  /* Asset tabs */
+  .tabs { display:flex; gap:6px; margin-bottom:18px; flex-wrap:wrap; }
+  .tab  { background:#161b22; border:1px solid #30363d; border-radius:6px;
+          padding:6px 18px; cursor:pointer; font-size:0.85rem; font-weight:600; color:#8b949e; }
+  .tab:hover  { border-color:#58a6ff33; color:#c9d1d9; }
+  .tab.active { background:#388bfd22; border-color:#58a6ff; color:#58a6ff; }
+
+  /* Stat rows */
+  .row-label { font-size:0.7rem; color:#8b949e; text-transform:uppercase;
+               letter-spacing:0.06em; margin-bottom:6px; margin-top:14px; }
+  .stats-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:10px; }
+  .stat-box   { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:10px 14px; }
+  .stat-box.avg { border-color:#21262d; background:#0d1117; }
+  .stat-label { font-size:0.68rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.05em; }
+  .stat-venue { font-size:0.72rem; font-weight:600; margin-top:2px; }
+  .stat-value { font-size:1.1rem; font-weight:700; margin-top:3px; }
+  .stat-sub   { font-size:0.72rem; color:#8b949e; margin-top:2px; }
+  .stat-avg-val { font-size:0.9rem; font-weight:600; margin-top:3px; }
+  .stat-avg-sub { font-size:0.68rem; color:#8b949e; margin-top:1px; }
+  .pos{color:#3fb950} .neg{color:#f85149} .neu{color:#e6edf3} .dim{color:#8b949e}
+
+  /* Charts */
+  .chart-wrap { background:#161b22; border:1px solid #30363d; border-radius:8px;
+                padding:16px; margin-top:18px; }
+  .chart-title { font-size:0.95rem; font-weight:600; color:#c9d1d9; margin-bottom:4px; }
+  .chart-desc  { font-size:0.75rem; color:#8b949e; margin-bottom:10px; }
+  .zoom-row    { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  .zoom-label  { font-size:0.72rem; color:#8b949e; }
+  .zoom-btn    { background:#21262d; border:1px solid #30363d; color:#c9d1d9;
+                 border-radius:4px; padding:3px 10px; font-size:0.72rem; cursor:pointer; }
+  .zoom-btn:hover  { background:#30363d; }
+  .zoom-btn.active { background:#388bfd22; border-color:#58a6ff; color:#58a6ff; }
+  canvas { width:100%!important; }
+  .status { font-size:0.75rem; color:#8b949e; margin-top:10px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:middle; }
+</style>
+</head>
+<body>
+
+<h1>Perp Spread & Funding Monitor</h1>
+<p class="subtitle">Kalshi (reference) vs Hyperliquid · Kraken · Coinbase · OKX · Lighter · auto-refreshes every 60s</p>
+
+<div class="tabs" id="asset-tabs"></div>
+
+<div id="stats-current-wrap">
+  <div class="row-label">Current snapshot</div>
+  <div class="stats-grid" id="grid-current"></div>
+</div>
+<div id="stats-spread-wrap">
+  <div class="row-label" id="avg-spread-label">7-day avg spread vs Kalshi</div>
+  <div class="stats-grid" id="grid-avg-spread"></div>
+</div>
+<div id="stats-fund-wrap">
+  <div class="row-label" id="avg-fund-label">7-day avg funding rates</div>
+  <div class="stats-grid" id="grid-avg-fund"></div>
+</div>
+
+<p class="status" id="status">Loading…</p>
+
+<div class="chart-wrap">
+  <div class="chart-title" id="spread-chart-title">Mid-Price Spread vs Kalshi ($)</div>
+  <div class="chart-desc">How much higher (+) or lower (−) each venue's mid is vs Kalshi. Zero = same price as Kalshi.</div>
+  <div class="zoom-row">
+    <span class="zoom-label">Y range:</span>
+    <button class="zoom-btn" onclick="setSpreadZoom(null,null,this)">Auto</button>
+    <button class="zoom-btn" onclick="setSpreadZoom(-2,2,this)">±$2</button>
+    <button class="zoom-btn" onclick="setSpreadZoom(-10,10,this)">±$10</button>
+    <button class="zoom-btn active" onclick="setSpreadZoom(-100,100,this)">±$100</button>
+    <button class="zoom-btn" onclick="setSpreadZoom(-500,500,this)">±$500</button>
+    <span class="zoom-label" style="margin-left:12px">Window:</span>
+    <button class="zoom-btn" onclick="setWindow(60,this)">1h</button>
+    <button class="zoom-btn" onclick="setWindow(240,this)">4h</button>
+    <button class="zoom-btn active" onclick="setWindow(480,this)">8h</button>
+    <button class="zoom-btn" onclick="setWindow(1440,this)">24h</button>
+    <button class="zoom-btn" onclick="setWindow(99999,this)">All</button>
+  </div>
+  <canvas id="spreadChart" height="200"></canvas>
+</div>
+
+<div class="chart-wrap">
+  <div class="chart-title" id="fund-chart-title">Funding Rates — Annualized %</div>
+  <div class="chart-desc">All venues normalized to ann. % regardless of settlement interval. Persistent gaps = carry opportunity.</div>
+  <div class="zoom-row">
+    <span class="zoom-label">Y range:</span>
+    <button class="zoom-btn" onclick="setFundingZoom(null,null,this)">Auto</button>
+    <button class="zoom-btn" onclick="setFundingZoom(-5,5,this)">±5%</button>
+    <button class="zoom-btn active" onclick="setFundingZoom(-20,20,this)">±20%</button>
+    <button class="zoom-btn" onclick="setFundingZoom(-100,100,this)">±100%</button>
+  </div>
+  <canvas id="fundingChart" height="200"></canvas>
+</div>
+
+<script>
+const ASSETS   = ['BTC','ETH','SOL','HYPE'];
+const WEEK_MINS = 7*24*60;
+
+const VENUES = [
+  { key:'hl',       label:'Hyperliquid', color:'#58a6ff', spreadKey:'hlSpread',       fundingKey:'hlFunding',       midKey:'hlMid' },
+  { key:'kraken',   label:'Kraken',      color:'#f0883e', spreadKey:'krakenSpread',   fundingKey:'krakenFunding',   midKey:'krakenMid' },
+  { key:'coinbase', label:'Coinbase',    color:'#a371f7', spreadKey:'coinbaseSpread', fundingKey:'coinbaseFunding', midKey:'coinbaseMid' },
+  { key:'okx',      label:'OKX',         color:'#e3b341', spreadKey:'okxSpread',      fundingKey:'okxFunding',      midKey:'okxMid' },
+  { key:'lighter',  label:'Lighter',     color:'#a8e6cf', spreadKey:'lighterSpread',  fundingKey:'lighterFunding',  midKey:'lighterMid' },
+];
+
+Chart.defaults.color       = '#8b949e';
+Chart.defaults.borderColor = '#30363d';
+Chart.defaults.font.family = "'Segoe UI',system-ui,sans-serif";
+Chart.defaults.font.size   = 11;
+
+let currentAsset = 'BTC';
+let allDataByAsset = {};
+let windowMins = 480;
+let spreadYMin=-100, spreadYMax=100, spreadYAuto=false;
+let fundingYMin=-20,  fundingYMax=20,  fundingYAuto=false;
+
+// ── Chart setup ───────────────────────────────────────────────────
+function ds(label,color) {
+  return { label, data:[], borderColor:color, backgroundColor:'transparent', borderWidth:1.5, pointRadius:0, tension:0.2 };
+}
+function zerods() {
+  return { label:'Zero', data:[], borderColor:'#484f58', backgroundColor:'transparent', borderWidth:1, borderDash:[4,4], pointRadius:0 };
+}
+function makeChart(id, datasets, yLabel) {
+  return new Chart(document.getElementById(id).getContext('2d'), {
+    type:'line', data:{ labels:[], datasets },
+    options:{
+      responsive:true, animation:false,
+      interaction:{ mode:'index', intersect:false },
+      plugins:{
+        legend:{ position:'top', labels:{ boxWidth:10, padding:12 } },
+        tooltip:{ backgroundColor:'#1c2128', borderColor:'#30363d', borderWidth:1, titleColor:'#c9d1d9', bodyColor:'#8b949e' },
+      },
+      scales:{
+        x:{ grid:{ color:'#21262d' }, ticks:{ maxTicksLimit:10, maxRotation:0 } },
+        y:{ grid:{ color:'#21262d' }, title:{ display:true, text:yLabel, color:'#8b949e' } },
+      },
+    },
+  });
+}
+
+const spreadChart  = makeChart('spreadChart',
+  [...VENUES.map(v=>ds(v.label,v.color)), zerods()], 'Price diff vs Kalshi ($)');
+const fundingChart = makeChart('fundingChart',
+  [ds('Kalshi','#3fb950'), ...VENUES.map(v=>ds(v.label,v.color)), zerods()],
+  'Annualized funding rate (%)');
+
+// ── Tabs ──────────────────────────────────────────────────────────
+function buildTabs() {
+  const wrap = document.getElementById('asset-tabs');
+  ASSETS.forEach(a => {
+    const btn = document.createElement('button');
+    btn.className = `tab${a===currentAsset?' active':''}`;
+    btn.textContent = a;
+    btn.onclick = () => switchAsset(a);
+    wrap.appendChild(btn);
+  });
+}
+function switchAsset(a) {
+  currentAsset = a;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.textContent===a));
+  document.getElementById('spread-chart-title').textContent = `${a} Mid-Price Spread vs Kalshi ($)`;
+  document.getElementById('fund-chart-title').textContent   = `${a} Funding Rates — Annualized %`;
+  buildStatBoxes();
+  renderCharts();
+}
+buildTabs();
+
+// ── Stat boxes ────────────────────────────────────────────────────
+function buildStatBoxes() {
+  // Current
+  document.getElementById('grid-current').innerHTML =
+    `<div class="stat-box"><div class="stat-label">Reference mid</div>
+     <div class="stat-venue"><span class="dot" style="background:#3fb950"></span>Kalshi</div>
+     <div class="stat-value neu" id="sk-mid">—</div>
+     <div class="stat-sub" id="sk-fund">funding: —</div></div>` +
+    VENUES.map(v =>
+      `<div class="stat-box"><div class="stat-label">vs Kalshi (mid)</div>
+       <div class="stat-venue"><span class="dot" style="background:${v.color}"></span>${v.label}</div>
+       <div class="stat-value" id="sc-${v.key}-spread">—</div>
+       <div class="stat-sub neu" id="sc-${v.key}-mid">mid: —</div>
+       <div class="stat-sub" id="sc-${v.key}-fund">funding: —</div></div>`
+    ).join('');
+
+  // Avg spread
+  document.getElementById('grid-avg-spread').innerHTML =
+    `<div class="stat-box avg"><div class="stat-label">7d avg mid</div>
+     <div class="stat-venue"><span class="dot" style="background:#3fb950"></span>Kalshi</div>
+     <div class="stat-avg-val neu" id="sa-kalshi-mid">—</div>
+     <div class="stat-avg-sub">reference (spread = $0)</div></div>` +
+    VENUES.map(v =>
+      `<div class="stat-box avg"><div class="stat-label">7d avg vs Kalshi</div>
+       <div class="stat-venue"><span class="dot" style="background:${v.color}"></span>${v.label}</div>
+       <div class="stat-avg-val" id="sa-${v.key}-spread">—</div>
+       <div class="stat-avg-sub neu" id="sa-${v.key}-mid">mid avg: —</div>
+       <div class="stat-avg-sub" id="sa-${v.key}-spread-sub">—</div></div>`
+    ).join('');
+
+  // Avg funding
+  document.getElementById('grid-avg-fund').innerHTML =
+    `<div class="stat-box avg"><div class="stat-label">7d avg funding</div>
+     <div class="stat-venue"><span class="dot" style="background:#3fb950"></span>Kalshi</div>
+     <div class="stat-avg-val" id="sa-kalshi-fund">—</div>
+     <div class="stat-avg-sub" id="sa-kalshi-fund-sub">—</div></div>` +
+    VENUES.map(v =>
+      `<div class="stat-box avg"><div class="stat-label">7d avg funding</div>
+       <div class="stat-venue"><span class="dot" style="background:${v.color}"></span>${v.label}</div>
+       <div class="stat-avg-val" id="sa-${v.key}-fund">—</div>
+       <div class="stat-avg-sub" id="sa-${v.key}-fund-sub">—</div></div>`
+    ).join('');
+}
+buildStatBoxes();
+
+// ── Helpers ───────────────────────────────────────────────────────
+function fmtS(v)  { return v==null||isNaN(v)?'—':`${v>=0?'+':''}$${v.toFixed(2)}`; }
+function fmtF(v)  { return v==null||isNaN(v)?'—':`${v>=0?'+':''}${v.toFixed(3)}%/yr`; }
+function fmtT(iso){ return new Date(iso).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false}); }
+function cc(v)    { return v==null||isNaN(v)?'neu':v>0?'pos':v<0?'neg':'neu'; }
+function avg(arr,key){ const v=arr.map(d=>d[key]).filter(v=>v!=null&&!isNaN(v)); return v.length?v.reduce((a,b)=>a+b,0)/v.length:null; }
+function setEl(id,text,cls){
+  const el=document.getElementById(id); if(!el) return;
+  el.textContent=text;
+  if(cls) el.className=el.className.replace(/\bpos\b|\bneg\b|\bneu\b/g,'').trim()+' '+cls;
+}
+
+// ── Update stats ──────────────────────────────────────────────────
+function updateStats(data) {
+  const last = data[data.length-1]; if(!last) return;
+
+  // Current
+  const prec = last.kalshiMid > 100 ? 0 : 4;
+  setEl('sk-mid', last.kalshiMid!=null?`$${last.kalshiMid.toFixed(prec)}`:'—', 'neu');
+  setEl('sk-fund', `funding: ${fmtF(last.kalshiFunding)}`);
+  VENUES.forEach(v => {
+    const sp=last[v.spreadKey], fu=last[v.fundingKey], m=last[v.midKey];
+    const dir = sp!=null?(sp>=0?' (above)':' (below)'):'';
+    setEl(`sc-${v.key}-spread`, sp!=null?`${fmtS(sp)}${dir}`:'—', cc(sp));
+    setEl(`sc-${v.key}-mid`, m!=null?`mid: $${m.toFixed(prec)}`:'mid: —');
+    setEl(`sc-${v.key}-fund`, `funding: ${fmtF(fu)}`);
+  });
+
+  // Averages
+  const weekData   = data.slice(-WEEK_MINS);
+  const availHours = (weekData.length/60).toFixed(1);
+  const lbl = weekData.length >= WEEK_MINS ? '7-day' : `${availHours}h`;
+  document.getElementById('avg-spread-label').textContent = `${lbl} avg spread vs Kalshi`;
+  document.getElementById('avg-fund-label').textContent   = `${lbl} avg funding rates`;
+  const pts = weekData.length;
+  const kMidAvg = avg(weekData,'kalshiMid');
+  setEl('sa-kalshi-mid', kMidAvg!=null?`$${kMidAvg.toFixed(prec)}`:'—', 'neu');
+  const kFundAvg = avg(weekData,'kalshiFunding');
+  setEl('sa-kalshi-fund', fmtF(kFundAvg), cc(kFundAvg));
+  setEl('sa-kalshi-fund-sub', `${pts} data points`);
+
+  VENUES.forEach(v => {
+    const spAvg=avg(weekData,v.spreadKey), fuAvg=avg(weekData,v.fundingKey), mAvg=avg(weekData,v.midKey);
+    const dir = spAvg!=null?(spAvg>=0?' above':' below'):'';
+    setEl(`sa-${v.key}-spread`, spAvg!=null?`${fmtS(spAvg)}${dir}`:'—', cc(spAvg));
+    setEl(`sa-${v.key}-mid`, mAvg!=null?`mid avg: $${mAvg.toFixed(prec)}`:'mid avg: —');
+    setEl(`sa-${v.key}-spread-sub`, `now ${fmtS(last[v.spreadKey])} · ${pts} pts`);
+    setEl(`sa-${v.key}-fund`, fmtF(fuAvg), cc(fuAvg));
+    setEl(`sa-${v.key}-fund-sub`, `${pts} pts · now ${fmtF(last[v.fundingKey])}`);
+  });
+}
+
+// ── Zoom ──────────────────────────────────────────────────────────
+function applyY(chart,mn,mx,auto){ chart.options.scales.y.min=auto?undefined:mn; chart.options.scales.y.max=auto?undefined:mx; }
+function deactivateGroup(btn,range){ [...btn.closest('.zoom-row').querySelectorAll('.zoom-btn')].filter((_,i)=>range?i<range[1]:true).forEach(b=>b.classList.remove('active')); }
+
+function setSpreadZoom(mn,mx,btn){ spreadYMin=mn; spreadYMax=mx; spreadYAuto=mn==null; btn.closest('.zoom-row').querySelectorAll('.zoom-btn').forEach((b,i)=>{if(i<5)b.classList.remove('active');}); btn.classList.add('active'); renderCharts(); }
+function setFundingZoom(mn,mx,btn){ fundingYMin=mn; fundingYMax=mx; fundingYAuto=mn==null; btn.closest('.zoom-row').querySelectorAll('.zoom-btn').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); renderCharts(); }
+function setWindow(mins,btn){ windowMins=mins; btn.closest('.zoom-row').querySelectorAll('.zoom-btn').forEach((b,i)=>{if(i>=5)b.classList.remove('active');}); btn.classList.add('active'); renderCharts(); }
+
+// ── Render charts ─────────────────────────────────────────────────
+function renderCharts() {
+  const data = (allDataByAsset[currentAsset] || []).slice(-windowMins);
+  if (!data.length) return;
+  const labels = data.map(d => fmtT(d.ts));
+
+  VENUES.forEach((v,i) => { spreadChart.data.datasets[i].data = data.map(d => d[v.spreadKey]); });
+  spreadChart.data.datasets[VENUES.length].data = data.map(()=>0);
+  spreadChart.data.labels = labels;
+  applyY(spreadChart, spreadYMin, spreadYMax, spreadYAuto);
+  spreadChart.update('none');
+
+  fundingChart.data.datasets[0].data = data.map(d=>d.kalshiFunding);
+  VENUES.forEach((v,i) => { fundingChart.data.datasets[i+1].data = data.map(d=>d[v.fundingKey]); });
+  fundingChart.data.datasets[VENUES.length+1].data = data.map(()=>0);
+  fundingChart.data.labels = labels;
+  applyY(fundingChart, fundingYMin, fundingYMax, fundingYAuto);
+  fundingChart.update('none');
+
+  updateStats(data);
+}
+
+// ── Load data for all assets ──────────────────────────────────────
+async function loadAsset(a) {
+  try {
+    const res = await fetch(`./data/chart_history_${a}.json?t=${Date.now()}`);
+    if (!res.ok) return;
+    allDataByAsset[a] = await res.json();
+  } catch(e) { /* asset not yet recorded */ }
+}
+
+async function loadAndRender() {
+  await Promise.all(ASSETS.map(a => loadAsset(a)));
+  renderCharts();
+  const d = allDataByAsset[currentAsset] || [];
+  const pts = d.length;
+  const last = pts ? new Date(d[d.length-1].ts) : null;
+  document.getElementById('status').textContent = pts
+    ? `${pts} pts for ${currentAsset} · last ${last.toLocaleTimeString()} · ${(pts/60).toFixed(1)}h history · refreshes every 60s`
+    : `No data for ${currentAsset} yet — run monitor.js for at least one cycle`;
+}
+
+loadAndRender();
+setInterval(loadAndRender, 60_000);
+</script>
+</body>
+</html>

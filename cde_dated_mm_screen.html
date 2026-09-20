@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>CDE Dated Futures MM — Screener</title>
+<style>
+  body{background:#0b0e11;color:#c9d1d9;font:13px/1.4 -apple-system,Segoe UI,Roboto,monospace;margin:0;padding:12px}
+  h1{font-size:15px;margin:0 0 4px} h2{font-size:13px;margin:0 0 6px;color:#e5e7eb}
+  table{border-collapse:collapse;width:100%;margin-bottom:16px}
+  th,td{border:1px solid #1f2937;padding:4px 7px;text-align:right;white-space:nowrap;font-size:12px}
+  th{background:#111827;color:#9ca3af;font-weight:600;cursor:pointer}
+  th:hover{background:#1d2739}
+  td.root{text-align:left;font-weight:600}
+  td.root a{color:#60a5fa;text-decoration:none}
+  .pos{color:#34d399} .neg{color:#f87171}
+  .ok{color:#34d399} .bad{color:#f87171}
+  .meta{color:#6b7280;font-size:11px;margin-bottom:10px}
+  .sortnav{font-size:11px;margin-bottom:10px}
+  tr:nth-child(even){background:#0f141a}
+  .fl{font-size:9px;color:#f59e0b;padding:1px 4px;border-radius:3px}
+
+  th{cursor:pointer} th.sortable:hover{opacity:0.7}
+  .sortnav{font-size:11px;color:#9ca3af;margin-bottom:10px}
+  .sortnav a{color:#9ca3af;text-decoration:none;margin:0 4px;padding:2px 6px;border-radius:3px}
+  .sortnav a.active{color:#0b0e11;background:#60a5fa;font-weight:600}
+</style>
+<script>
+  const ALL_ROWS = [{"root":"XLM","fNet":1.7153125,"bNet":1.720625,"combined":3.4359375,"fCarry":3.044371759863335,"bCarry":-13.766729007440057,"fBasis":22.316371759863333,"fFund":19.272,"fNetEdge":1.7153125,"bNetEdge":1.720625,"fContracts":5,"bContracts":5,"fFees":0.7000000000000001,"bFees":0.7000000000000001,"fProf":true,"bProf":true,"fMid":0.193225,"bMid":0.19365,"pMid":0.1927,"pFundAPY":19.272,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":5689701.9,"pVol24":17204818.4},{"root":"HYPE","fNet":1.60325,"bNet":1.6201249999999998,"combined":3.223375,"fCarry":2.918566493006251,"bCarry":-0.4667882165769619,"fBasis":11.678566493006253,"fFund":8.760000000000002,"fNetEdge":1.60325,"bNetEdge":1.6201249999999998,"fContracts":5,"bContracts":5,"fFees":0.7000000000000001,"bFees":0.7000000000000001,"fProf":true,"bProf":true,"fMid":92.13,"bMid":92.805,"pMid":92.16,"pFundAPY":8.760000000000002,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":1623330.6,"pVol24":22157355.5},{"root":"BTC","fNet":1.6009499999999999,"bNet":1.6146749999999999,"combined":3.2156249999999997,"fCarry":5.568185087411308,"bCarry":-4.473686864601157,"fBasis":17.832185087411307,"fFund":12.264,"fNetEdge":1.6009499999999999,"bNetEdge":1.6146749999999999,"fContracts":6,"bContracts":6,"fFees":0.8400000000000001,"bFees":0.8400000000000001,"fProf":true,"bProf":true,"fMid":81365,"bMid":81822.5,"pMid":81210,"pFundAPY":12.264,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":110538665.6,"pVol24":558775150.2},{"root":"XRP","fNet":1.4720125,"bNet":1.5001875,"combined":2.9722,"fCarry":20.565141907482555,"bCarry":8.244125424559519,"fBasis":26.697141907482553,"fFund":6.132,"fNetEdge":1.4720125,"bNetEdge":1.5001875,"fContracts":7,"bContracts":7,"fFees":0.9800000000000001,"bFees":0.9800000000000001,"fProf":true,"bProf":true,"fMid":1.40115,"bMid":1.41725,"pMid":1.397,"pFundAPY":6.132,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":42057310.35,"pVol24":95742388.3},{"root":"BNB","fNet":1.4516250000000002,"bNet":1.4625000000000001,"combined":2.9141250000000003,"fCarry":2.0435932956197753,"bCarry":-3.605461358716913,"fBasis":11.679593295619775,"fFund":9.636,"fNetEdge":1.4516250000000002,"bNetEdge":1.4625000000000001,"fContracts":6,"bContracts":6,"fFees":0.8400000000000001,"bFees":0.8400000000000001,"fProf":true,"bProf":true,"fMid":763.875,"bMid":767.5,"pMid":763.225,"pFundAPY":9.636,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":136009.8,"pVol24":412065.5},{"root":"LINK","fNet":1.3461000000000003,"bNet":1.3535999999999997,"combined":2.6997,"fCarry":2.4333159413720793,"bCarry":-13.860792478747882,"fBasis":22.58131594137208,"fFund":20.148,"fNetEdge":1.3461000000000003,"bNetEdge":1.3535999999999997,"fContracts":8,"bContracts":8,"fFees":1.12,"bFees":1.12,"fProf":true,"bProf":true,"fMid":12.3305,"bMid":12.368,"pMid":12.3055,"pFundAPY":20.148,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":3073324.8,"pVol24":8788689},{"root":"SOL","fNet":1.1440000000000001,"bNet":1.1565999999999996,"combined":2.3005999999999998,"fCarry":2.8367964709925353,"bCarry":-7.1687476138394395,"fBasis":17.728796470992535,"fFund":14.892,"fNetEdge":1.1440000000000001,"bNetEdge":1.1565999999999996,"fContracts":8,"bContracts":8,"fFees":1.12,"bFees":1.12,"fProf":true,"bProf":true,"fMid":113.2,"bMid":113.83,"pMid":113.035,"pFundAPY":14.892,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":27200263.2,"pVol24":90957923.1},{"root":"DOGE","fNet":0.8889374999999999,"bNet":0.9239999999999999,"combined":1.8129374999999999,"fCarry":16.06416183895134,"bCarry":14.504107867193207,"fBasis":16.94016183895134,"fFund":0.876,"fNetEdge":0.8889374999999999,"bNetEdge":0.9239999999999999,"fContracts":11,"bContracts":11,"fFees":1.54,"bFees":1.54,"fProf":true,"bProf":true,"fMid":0.088325,"bMid":0.0896,"pMid":0.088235,"pFundAPY":0.876,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":4715197.7,"pVol24":5511558.3},{"root":"SUI","fNet":0.76965,"bNet":0.7995000000000001,"combined":1.56915,"fCarry":18.931924499622244,"bCarry":7.122230108509138,"fBasis":26.815924499622245,"fFund":7.884,"fNetEdge":0.76965,"bNetEdge":0.7995000000000001,"fContracts":12,"bContracts":12,"fFees":1.6800000000000002,"bFees":1.6800000000000002,"fProf":true,"bProf":true,"fMid":0.81655,"bMid":0.8265,"pMid":0.81555,"pFundAPY":7.884,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":2312686.2,"pVol24":8880769.2},{"root":"HBAR","fNet":0.6976499999999999,"bNet":0.7093499999999997,"combined":1.4069999999999996,"fCarry":-1.9726825121336624,"bCarry":-6.303166513142164,"fBasis":10.291317487866337,"fFund":12.264,"fNetEdge":0.6976499999999999,"bNetEdge":0.7093499999999997,"fContracts":12,"bContracts":12,"fFees":1.6800000000000002,"bFees":1.6800000000000002,"fProf":true,"bProf":true,"fMid":0.079255,"bMid":0.079645,"pMid":0.07921,"pFundAPY":12.264,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":824880.55,"pVol24":7039107.3},{"root":"LTC","fNet":0.08351249999999988,"bNet":0.09456249999999988,"combined":0.17807499999999976,"fCarry":15.783205557120006,"bCarry":-8.239665087857711,"fBasis":33.30320555712001,"fFund":17.520000000000003,"fNetEdge":0.08351249999999988,"bNetEdge":0.09456249999999988,"fContracts":17,"bContracts":17,"fFees":2.3800000000000003,"bFees":2.3800000000000003,"fProf":true,"bProf":true,"fMid":57.965,"bMid":58.225,"pMid":57.895,"pFundAPY":17.520000000000003,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":885274.6,"pVol24":4364564},{"root":"BCH","fNet":-0.14107500000000073,"bNet":-0.12960000000000038,"combined":-0.2706750000000011,"fCarry":-11.636676573251593,"bCarry":-18.234067148581275,"fBasis":12.891323426748405,"fFund":24.528,"fNetEdge":-0.14107500000000073,"bNetEdge":-0.12960000000000038,"fContracts":18,"bContracts":18,"fFees":2.5200000000000005,"bFees":2.5200000000000005,"fProf":false,"bProf":false,"fMid":264.325,"bMid":265.6,"pMid":264.4,"pFundAPY":24.528,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":1918883.25,"pVol24":5729911.2},{"root":"ETH","fNet":-0.16244999999999976,"bNet":-0.1442250000000005,"combined":-0.30667500000000025,"fCarry":13.977160177679082,"bCarry":1.4133392655850692,"fBasis":19.233160177679082,"fFund":5.256,"fNetEdge":-0.16244999999999976,"bNetEdge":-0.1442250000000005,"fContracts":19,"bContracts":18,"fFees":2.66,"bFees":2.5200000000000005,"fProf":false,"bProf":false,"fMid":2629,"bMid":2639.75,"pMid":2622.5,"pFundAPY":5.256,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":26387194.25,"pVol24":158360449.25},{"root":"ADA","fNet":-0.5972999999999997,"bNet":-0.5862999999999996,"combined":-1.1835999999999993,"fCarry":23.807251452862367,"bCarry":2.559089182817832,"fBasis":29.939251452862365,"fFund":6.132,"fNetEdge":-0.5972999999999997,"bNetEdge":-0.5862999999999996,"fContracts":22,"bContracts":22,"fFees":3.08,"bFees":3.08,"fProf":false,"bProf":false,"fMid":0.2257,"bMid":0.2267,"pMid":0.2254,"pFundAPY":6.132,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":1145909.2,"pVol24":10099243},{"root":"DOT","fNet":-3.6718,"bNet":-3.6608,"combined":-7.3326,"fCarry":2.327387078039777,"bCarry":-3.8444653015422885,"fBasis":11.963387078039776,"fFund":9.636,"fNetEdge":-3.6718,"bNetEdge":-3.6608,"fContracts":44,"bContracts":44,"fFees":6.16,"bFees":6.16,"fProf":false,"bProf":false,"fMid":1.131,"bMid":1.136,"pMid":1.13,"pFundAPY":9.636,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":176506,"pVol24":1469847.6},{"root":"AVAX","fNet":-5.936999999999999,"bNet":-5.925000000000001,"combined":-11.862,"fCarry":-5.023051003347657,"bCarry":-17.862489306221605,"fBasis":20.380948996652343,"fFund":25.404,"fNetEdge":-5.936999999999999,"bNetEdge":-5.925000000000001,"fContracts":60,"bContracts":60,"fFees":8.4,"bFees":8.4,"fProf":false,"bProf":false,"fMid":8.21,"bMid":8.25,"pMid":8.195,"pFundAPY":25.404,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":303522.4,"pVol24":645044.4},{"root":"SHIB","fNet":-10.248875000000002,"bNet":-10.120500000000002,"combined":-20.369375000000005,"fCarry":1.4903251241982827,"bCarry":2.8933529938830325,"fBasis":4.994325124198283,"fFund":3.504,"fNetEdge":-10.248875000000002,"bNetEdge":-10.120500000000002,"fContracts":91,"bContracts":90,"fFees":12.740000000000002,"bFees":12.600000000000001,"fProf":false,"bProf":false,"fMid":0.005475,"bMid":0.00551,"pMid":0.00547,"pFundAPY":3.504,"fExpiry":"2026-09-25T15:00:00Z","bExpiry":"2026-10-30T16:00:00Z","fTmsD":6.6803425347222225,"bTmsD":41.722009201388886,"fVol24":59786.8,"pVol24":112874.4}];
+  function render(mode) {
+    const keyMap = {net:'combined',front:'fNet',back:'bNet',carry:'fCarry',div:'fCarry'};
+    const key = keyMap[mode] || 'combined';
+    const rows = [...ALL_ROWS].sort((a,b)=> (b[key] ?? -1e9) - (a[key] ?? -1e9));
+    const tb = document.getElementById('tbody');
+    tb.innerHTML = rows.map(r => {
+      const fProf = r.fProf ? '✅' : '❌';
+      const bProf = r.bProf ? '✅' : '❌';
+      return '<tr>'
+        + '<td class="root">' + r.root + '</td>'
+        + '<td>' + (r.fMid != null ? r.fMid.toFixed(r.fMid>100?0:r.fMid>1?2:6) : '—') + '</td>'
+        + '<td>' + (r.bMid != null ? r.bMid.toFixed(r.bMid>100?0:r.bMid>1?2:6) : '—') + '</td>'
+        + '<td>' + (r.pMid != null ? r.pMid.toFixed(r.pMid>100?0:r.pMid>1?2:6) : '—') + '</td>'
+        + '<td class="' + (r.fNet >= 0 ? 'pos' : 'neg') + '">' + r.fNet.toFixed(2) + '</td>'
+        + '<td class="' + (r.bNet >= 0 ? 'pos' : 'neg') + '">' + r.bNet.toFixed(2) + '</td>'
+        + '<td class="' + (r.combined >= 0 ? 'pos' : 'neg') + '">' + r.combined.toFixed(2) + '</td>'
+        + '<td>' + fProf + bProf + '</td>'
+        + '<td>' + r.fContracts + '</td>'
+        + '<td>' + r.bContracts + '</td>'
+        + '<td class="' + (r.fFees < r.fNet ? 'pos' : 'neg') + '">' + r.fFees.toFixed(2) + '</td>'
+        + '<td class="' + (r.bFees < r.bNet ? 'pos' : 'neg') + '">' + r.bFees.toFixed(2) + '</td>'
+        + '<td>' + (r.fCarry != null ? (r.fCarry >= 0 ? '+' : '') + r.fCarry.toFixed(1) + '%' : '—') + '</td>'
+        + '<td>' + (r.bCarry != null ? (r.bCarry >= 0 ? '+' : '') + r.bCarry.toFixed(1) + '%' : '—') + '</td>'
+        + '<td>' + (r.fFund != null ? (r.fFund >= 0 ? '+' : '') + r.fFund.toFixed(1) + '%' : '—') + '</td>'
+        + '<td><span class="fl">' + (r.fExpiry ? r.fExpiry.slice(0,10) : '—') + '</span></td>'
+        + '<td><span class="fl">' + (r.bExpiry ? r.bExpiry.slice(0,10) : '—') + '</span></td>'
+        + '<td>' + (r.fVol24 != null ? '$' + (r.fVol24 >= 1e6 ? (r.fVol24/1e6).toFixed(1)+'M' : r.fVol24.toFixed(0)) : '—') + '</td>'
+        + '</tr>';
+    }).join('');
+  }
+  document.getElementById('frontNet').onclick = () => {render('front');};
+  document.getElementById('backNet').onclick = () => {render('back');};
+  document.getElementById('combined').onclick = () => {render('net');};
+  document.getElementById('carry').onclick = () => {render('carry');};
+  render('net');
+</script>
+</head><body>
+<h1>CDE Dated Futures MM — Perp Hedge Screener</h1>
+<div class="meta">width=10bps | notional=$5.0k/side | fee=$0.07/ctr ($0.02+$0.05) | keyless perp hedge (no public CDE book) · generated 2026-09-18T22:40:20.825Z</div>
+<div class="sortnav">
+  Sort: <span class="active" id="combined">Combined Edge</span> |
+  <a id="frontNet">Front Net</a> | <a id="backNet">Back Net</a> |
+  <a id="carry">Front Carry</a>
+</div>
+<table>
+<thead><tr>
+  <th>Token</th><th>Front mid</th><th>Back mid</th><th>Perp mid</th>
+  <th>Front net</th><th>Back net</th><th>Combined</th><th>Profitable</th>
+  <th>nCtr F/B</th>
+  <th>Fee F/B</th>
+  <th>Carry F/B</th>
+  <th>Fund APY</th>
+  <th>Front expiry</th><th>Back expiry</th><th>Vol24</th>
+</tr></thead>
+<tbody id="tbody"><tr>
+      <td class="root">XLM</td>
+      <td>0.193225</td>
+      <td>0.193650</td>
+      <td>0.192700</td>
+      <td class="pos">1.72</td>
+      <td class="pos">1.72</td>
+      <td class="pos">3.44</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>5</td>
+      <td>5</td>
+      <td class="pos">0.70</td>
+      <td class="pos">0.70</td>
+      <td>+3.0%</td>
+      <td>-13.8%</td>
+      <td>+19.3%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$5.7M</td>
+    </tr>
+<tr>
+      <td class="root">HYPE</td>
+      <td>92.13</td>
+      <td>92.81</td>
+      <td>92.16</td>
+      <td class="pos">1.60</td>
+      <td class="pos">1.62</td>
+      <td class="pos">3.22</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>5</td>
+      <td>5</td>
+      <td class="pos">0.70</td>
+      <td class="pos">0.70</td>
+      <td>+2.9%</td>
+      <td>-0.5%</td>
+      <td>+8.8%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$1.6M</td>
+    </tr>
+<tr>
+      <td class="root">BTC</td>
+      <td>81365</td>
+      <td>81823</td>
+      <td>81210</td>
+      <td class="pos">1.60</td>
+      <td class="pos">1.61</td>
+      <td class="pos">3.22</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>6</td>
+      <td>6</td>
+      <td class="pos">0.84</td>
+      <td class="pos">0.84</td>
+      <td>+5.6%</td>
+      <td>-4.5%</td>
+      <td>+12.3%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$110.5M</td>
+    </tr>
+<tr>
+      <td class="root">XRP</td>
+      <td>1.40</td>
+      <td>1.42</td>
+      <td>1.40</td>
+      <td class="pos">1.47</td>
+      <td class="pos">1.50</td>
+      <td class="pos">2.97</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>7</td>
+      <td>7</td>
+      <td class="pos">0.98</td>
+      <td class="pos">0.98</td>
+      <td>+20.6%</td>
+      <td>+8.2%</td>
+      <td>+6.1%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$42.1M</td>
+    </tr>
+<tr>
+      <td class="root">BNB</td>
+      <td>764</td>
+      <td>768</td>
+      <td>763</td>
+      <td class="pos">1.45</td>
+      <td class="pos">1.46</td>
+      <td class="pos">2.91</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>6</td>
+      <td>6</td>
+      <td class="pos">0.84</td>
+      <td class="pos">0.84</td>
+      <td>+2.0%</td>
+      <td>-3.6%</td>
+      <td>+9.6%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$136010</td>
+    </tr>
+<tr>
+      <td class="root">LINK</td>
+      <td>12.33</td>
+      <td>12.37</td>
+      <td>12.31</td>
+      <td class="pos">1.35</td>
+      <td class="pos">1.35</td>
+      <td class="pos">2.70</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>8</td>
+      <td>8</td>
+      <td class="pos">1.12</td>
+      <td class="pos">1.12</td>
+      <td>+2.4%</td>
+      <td>-13.9%</td>
+      <td>+20.1%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$3.1M</td>
+    </tr>
+<tr>
+      <td class="root">SOL</td>
+      <td>113</td>
+      <td>114</td>
+      <td>113</td>
+      <td class="pos">1.14</td>
+      <td class="pos">1.16</td>
+      <td class="pos">2.30</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>8</td>
+      <td>8</td>
+      <td class="pos">1.12</td>
+      <td class="pos">1.12</td>
+      <td>+2.8%</td>
+      <td>-7.2%</td>
+      <td>+14.9%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$27.2M</td>
+    </tr>
+<tr>
+      <td class="root">DOGE</td>
+      <td>0.088325</td>
+      <td>0.089600</td>
+      <td>0.088235</td>
+      <td class="pos">0.89</td>
+      <td class="pos">0.92</td>
+      <td class="pos">1.81</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>11</td>
+      <td>11</td>
+      <td class="neg">1.54</td>
+      <td class="neg">1.54</td>
+      <td>+16.1%</td>
+      <td>+14.5%</td>
+      <td>+0.9%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$4.7M</td>
+    </tr>
+<tr>
+      <td class="root">SUI</td>
+      <td>0.816550</td>
+      <td>0.826500</td>
+      <td>0.815550</td>
+      <td class="pos">0.77</td>
+      <td class="pos">0.80</td>
+      <td class="pos">1.57</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>12</td>
+      <td>12</td>
+      <td class="neg">1.68</td>
+      <td class="neg">1.68</td>
+      <td>+18.9%</td>
+      <td>+7.1%</td>
+      <td>+7.9%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$2.3M</td>
+    </tr>
+<tr>
+      <td class="root">HBAR</td>
+      <td>0.079255</td>
+      <td>0.079645</td>
+      <td>0.079210</td>
+      <td class="pos">0.70</td>
+      <td class="pos">0.71</td>
+      <td class="pos">1.41</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>12</td>
+      <td>12</td>
+      <td class="neg">1.68</td>
+      <td class="neg">1.68</td>
+      <td>-2.0%</td>
+      <td>-6.3%</td>
+      <td>+12.3%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$824881</td>
+    </tr>
+<tr>
+      <td class="root">LTC</td>
+      <td>57.97</td>
+      <td>58.23</td>
+      <td>57.90</td>
+      <td class="pos">0.08</td>
+      <td class="pos">0.09</td>
+      <td class="pos">0.18</td>
+      <td><span class="ok">✅</span><span class="ok">✅</span></td>
+      <td>17</td>
+      <td>17</td>
+      <td class="neg">2.38</td>
+      <td class="neg">2.38</td>
+      <td>+15.8%</td>
+      <td>-8.2%</td>
+      <td>+17.5%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$885275</td>
+    </tr>
+<tr>
+      <td class="root">BCH</td>
+      <td>264</td>
+      <td>266</td>
+      <td>264</td>
+      <td class="neg">-0.14</td>
+      <td class="neg">-0.13</td>
+      <td class="neg">-0.27</td>
+      <td><span class="bad">❌</span><span class="bad">❌</span></td>
+      <td>18</td>
+      <td>18</td>
+      <td class="neg">2.52</td>
+      <td class="neg">2.52</td>
+      <td>-11.6%</td>
+      <td>-18.2%</td>
+      <td>+24.5%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$1.9M</td>
+    </tr>
+<tr>
+      <td class="root">ETH</td>
+      <td>2629</td>
+      <td>2640</td>
+      <td>2623</td>
+      <td class="neg">-0.16</td>
+      <td class="neg">-0.14</td>
+      <td class="neg">-0.31</td>
+      <td><span class="bad">❌</span><span class="bad">❌</span></td>
+      <td>19</td>
+      <td>18</td>
+      <td class="neg">2.66</td>
+      <td class="neg">2.52</td>
+      <td>+14.0%</td>
+      <td>+1.4%</td>
+      <td>+5.3%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$26.4M</td>
+    </tr>
+<tr>
+      <td class="root">ADA</td>
+      <td>0.225700</td>
+      <td>0.226700</td>
+      <td>0.225400</td>
+      <td class="neg">-0.60</td>
+      <td class="neg">-0.59</td>
+      <td class="neg">-1.18</td>
+      <td><span class="bad">❌</span><span class="bad">❌</span></td>
+      <td>22</td>
+      <td>22</td>
+      <td class="neg">3.08</td>
+      <td class="neg">3.08</td>
+      <td>+23.8%</td>
+      <td>+2.6%</td>
+      <td>+6.1%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$1.1M</td>
+    </tr>
+<tr>
+      <td class="root">DOT</td>
+      <td>1.13</td>
+      <td>1.14</td>
+      <td>1.13</td>
+      <td class="neg">-3.67</td>
+      <td class="neg">-3.66</td>
+      <td class="neg">-7.33</td>
+      <td><span class="bad">❌</span><span class="bad">❌</span></td>
+      <td>44</td>
+      <td>44</td>
+      <td class="neg">6.16</td>
+      <td class="neg">6.16</td>
+      <td>+2.3%</td>
+      <td>-3.8%</td>
+      <td>+9.6%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$176506</td>
+    </tr>
+<tr>
+      <td class="root">AVAX</td>
+      <td>8.21</td>
+      <td>8.25</td>
+      <td>8.20</td>
+      <td class="neg">-5.94</td>
+      <td class="neg">-5.93</td>
+      <td class="neg">-11.86</td>
+      <td><span class="bad">❌</span><span class="bad">❌</span></td>
+      <td>60</td>
+      <td>60</td>
+      <td class="neg">8.40</td>
+      <td class="neg">8.40</td>
+      <td>-5.0%</td>
+      <td>-17.9%</td>
+      <td>+25.4%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$303522</td>
+    </tr>
+<tr>
+      <td class="root">SHIB</td>
+      <td>0.005475</td>
+      <td>0.005510</td>
+      <td>0.005470</td>
+      <td class="neg">-10.25</td>
+      <td class="neg">-10.12</td>
+      <td class="neg">-20.37</td>
+      <td><span class="bad">❌</span><span class="bad">❌</span></td>
+      <td>91</td>
+      <td>90</td>
+      <td class="neg">12.74</td>
+      <td class="neg">12.60</td>
+      <td>+1.5%</td>
+      <td>+2.9%</td>
+      <td>+3.5%</td>
+      <td><span class="fl">2026-09-25</span></td>
+      <td><span class="fl">2026-10-30</span></td>
+      <td>$59787</td>
+    </tr></tbody>
+</table>
+</body></html>

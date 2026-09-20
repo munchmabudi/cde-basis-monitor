@@ -1,0 +1,190 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CDE MM Viability</title>
+<style>
+ body{font:14px/1.4 system-ui,Segoe UI,Arial;margin:0;padding:18px;background:#0f1115;color:#e6e6e6}
+ h1{font-size:18px;margin:0 0 6px} .sub{color:#9aa;font-size:12px;margin-bottom:14px}
+ .controls{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:14px;background:#171a21;padding:12px;border-radius:8px}
+ .ctl{display:flex;flex-direction:column;gap:4px} .ctl label{font-size:11px;color:#9aa;text-transform:uppercase}
+ select,input{background:#0f1115;color:#e6e6e6;border:1px solid #2a2f3a;border-radius:6px;padding:6px 8px;font-size:13px}
+ table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+ th,td{padding:6px 8px;border-bottom:1px solid #232833;text-align:right}
+ th:nth-child(1),td:nth-child(1),th:nth-child(2),td:nth-child(2){text-align:left}
+ th{position:sticky;top:0;background:#171a21;color:#cdd;font-size:12px;cursor:pointer;user-select:none}
+ tr:hover{background:#1b1f29}
+ .tot{background:#171a21;font-weight:600}
+ .tot td{border-top:2px solid #2a2f3a}
+ .warn{color:#e0a;font-size:11px}
+ .via-hi{color:#4caf50;font-weight:600} .via-mid{color:#cddc39} .via-lo{color:#ff9800} .via-vlo{color:#ef5350} .via-na{color:#777}
+ .toklist{display:flex;flex-direction:column;gap:2px;max-height:240px;overflow:auto;background:#0f1115;border:1px solid #2a2f3a;border-radius:6px;padding:6px 8px;min-width:150px}
+ .tokrow{display:flex;align-items:center;gap:8px;font-size:12px;padding:2px 0;cursor:pointer}
+ .tokrow input{accent-color:#4a9;width:14px;height:14px}
+ .tokrow.master{border-bottom:1px solid #2a2f3a;margin-bottom:4px;padding-bottom:4px;font-weight:600;color:#cdd}
+ #summary{margin-top:14px;background:#171a21;padding:12px;border-radius:8px;font-size:13px;white-space:pre-line}
+</style></head>
+<body>
+<h1>CDE MM Viability Explorer</h1>
+<div class="sub">Perp + dated-futures legs, all tokens. CDE margin rates are ASSUMED (Coinbase Derivatives clearing margin not yet confirmed). Hedge = ONE side. Dropdowns recompute instantly. Viability = % of polls where combined bid+ask net &gt; 0 (matches Telegram "✅" green).</div>
+
+<div class="controls">
+  <div class="ctl"><label>Strategy</label>
+    <select id="strategy">
+      <option value="both">Perp + Futures (both)</option>
+      <option value="perp">Perp only</option>
+      <option value="fut">Futures only</option>
+    </select></div>
+  <div class="ctl"><label>CDE perp leverage</label>
+    <select id="cdeRatePerp">
+      <option value="initialMarginRate">Aggressive 10x (10%)</option>
+      <option value="conservativeRate">Conservative 5x (20%)</option>
+      <option value="lev2">2x (50%)</option>
+      <option value="lev3">3x (33%)</option>
+    </select></div>
+  <div class="ctl"><label>CDE futures leverage</label>
+    <select id="cdeRateFut">
+      <option value="futuresRate">Futures 4x (25%)</option>
+      <option value="lev2">2x (50%)</option>
+      <option value="lev3">3x (33%)</option>
+    </select></div>
+  <div class="ctl"><label>Hedge venue</label>
+    <select id="hedgeVenue">
+      <option value="cheapest">Cheapest per token</option>
+      <option value="hyperliquid">Hyperliquid</option>
+      <option value="okx">OKX</option>
+      <option value="deribit">Deribit</option>
+      <option value="kraken">Kraken</option>
+      <option value="coinbase">Coinbase</option>
+    </select></div>
+  <div class="ctl"><label>Tokens (tick to include)</label>
+    <div class="toklist" id="toklist"></div></div>
+</div>
+
+<table id="tbl">
+  <thead><tr>
+    <th data-k="assetKey">Token</th><th data-k="leg">Leg</th><th data-k="notional">Notional</th>
+    <th data-k="cde">CDE margin</th><th data-k="hedge">Hedge (1 side)</th>
+    <th data-k="lev">Hedge lev</th><th data-k="lev2">Hedge cap @½lev</th>
+    <th data-k="swd">Weekday Stipend</th><th data-k="swe">Weekend Stipend</th>
+    <th data-k="ror">Rate of Return</th>
+    <th data-k="v24">Viability 24h</th><th data-k="v7">Viability 7d</th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+  <tfoot><tr class="tot" id="totrow"></tr></tfoot>
+</table>
+<div id="summary"></div>
+<div class="warn">Lighter = n/a (leverage unknown). Deribit perp hedge only exists for BTC/ETH. "Cheapest" picks the lowest-margin venue per token.</div>
+
+<script>
+const DATA = {"cde":{"initialMarginRate":0.1,"conservativeRate":0.2,"futuresRate":0.25,"assumed":true},"venues":["hyperliquid","okx","deribit","kraken","coinbase","lighter"],"majors":["BTC","ETH","SOL","XRP","nBTC","nETH","nSOL","nXRP"],"stipend":{"perp":{"alt":{"weekday":3000,"weekend":1500},"major":{"weekday":0,"weekend":0}},"fut":{"alt":{"weekday":2000,"weekend":1000},"major":{"weekday":0,"weekend":0}}},"rows":[{"assetKey":"BTC","leg":"perp","notional":162252.02,"cde10":16225.202,"cde20":32450.404,"cde25":40563.005,"hedge":{"hyperliquid":4056.3005,"okx":1622.5202,"deribit":3245.0404,"kraken":32450.404,"coinbase":16225.202,"lighter":"unk"},"lev":{"hyperliquid":40,"okx":100,"deribit":50,"kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"ETH","leg":"perp","notional":52599.799999999996,"cde10":5259.98,"cde20":10519.96,"cde25":13149.949999999999,"hedge":{"hyperliquid":2103.9919999999997,"okx":525.9979999999999,"deribit":1051.9959999999999,"kraken":10519.96,"coinbase":5259.98,"lighter":"unk"},"lev":{"hyperliquid":25,"okx":100,"deribit":50,"kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"SOL","leg":"perp","notional":22002,"cde10":2200.2000000000003,"cde20":4400.400000000001,"cde25":5500.5,"hedge":{"hyperliquid":1100.1,"okx":440.04,"deribit":"unk","kraken":4400.4,"coinbase":2200.2,"lighter":"unk"},"lev":{"hyperliquid":20,"okx":50,"deribit":"NA","kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"XRP","leg":"perp","notional":28118,"cde10":2811.8,"cde20":5623.6,"cde25":7029.5,"hedge":{"hyperliquid":1405.9,"okx":562.36,"deribit":"unk","kraken":5623.6,"coinbase":2811.8,"lighter":"unk"},"lev":{"hyperliquid":20,"okx":50,"deribit":"NA","kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"nBTC","leg":"perp","notional":40563.005,"cde10":4056.3005,"cde20":8112.601,"cde25":10140.75125,"hedge":{"hyperliquid":1014.075125,"okx":405.63005,"deribit":811.2601,"kraken":8112.601,"coinbase":4056.3005,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"nETH","leg":"perp","notional":13149.949999999999,"cde10":1314.995,"cde20":2629.99,"cde25":3287.4874999999997,"hedge":{"hyperliquid":525.9979999999999,"okx":131.49949999999998,"deribit":262.99899999999997,"kraken":2629.99,"coinbase":1314.995,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"nSOL","leg":"perp","notional":16501.5,"cde10":1650.15,"cde20":3300.3,"cde25":4125.375,"hedge":{"hyperliquid":825.075,"okx":330.03,"deribit":"unk","kraken":3300.3,"coinbase":1650.15,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"nXRP","leg":"perp","notional":14059,"cde10":1405.9,"cde20":2811.8,"cde25":3514.75,"hedge":{"hyperliquid":702.95,"okx":281.18,"deribit":"unk","kraken":2811.8,"coinbase":1405.9,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"ADA","leg":"perp","notional":4526.6,"cde10":452.6600000000001,"cde20":905.3200000000002,"cde25":1131.65,"hedge":{"hyperliquid":452.66,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"LTC","leg":"perp","notional":5847.6,"cde10":584.7600000000001,"cde20":1169.5200000000002,"cde25":1461.9,"hedge":{"hyperliquid":584.76,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"DOGE","leg":"perp","notional":8681.7,"cde10":868.1700000000001,"cde20":1736.3400000000001,"cde25":2170.425,"hedge":{"hyperliquid":868.1700000000001,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"AVAX","leg":"perp","notional":4418.84,"cde10":441.884,"cde20":883.768,"cde25":1104.71,"hedge":{"hyperliquid":441.884,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"LINK","leg":"perp","notional":9988,"cde10":998.8000000000001,"cde20":1997.6000000000001,"cde25":2497,"hedge":{"hyperliquid":998.8,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"SUI","leg":"perp","notional":7000.16,"cde10":700.0160000000001,"cde20":1400.0320000000002,"cde25":1750.04,"hedge":{"hyperliquid":700.016,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"BNB","leg":"perp","notional":15356,"cde10":1535.6000000000001,"cde20":3071.2000000000003,"cde25":3839,"hedge":{"hyperliquid":1535.6,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"HYPE","leg":"perp","notional":18711,"cde10":1871.1000000000001,"cde20":3742.2000000000003,"cde25":4677.75,"hedge":{"hyperliquid":1871.1,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"DOT","leg":"perp","notional":1839.52,"cde10":183.952,"cde20":367.904,"cde25":459.88,"hedge":{"hyperliquid":183.952,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"XLM","leg":"perp","notional":19530,"cde10":1953,"cde20":3906,"cde25":4882.5,"hedge":{"hyperliquid":3906,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":5,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"kSHIB","leg":"perp","notional":2744,"cde10":274.40000000000003,"cde20":548.8000000000001,"cde25":686,"hedge":{"hyperliquid":274.4,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"HBAR","leg":"perp","notional":6813.04,"cde10":681.3040000000001,"cde20":1362.6080000000002,"cde25":1703.26,"hedge":{"hyperliquid":1362.608,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":5,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"BCH","leg":"perp","notional":5014.8,"cde10":501.48,"cde20":1002.96,"cde25":1253.7,"hedge":{"hyperliquid":501.48,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"PAXG","leg":"perp","notional":17449.2,"cde10":1744.92,"cde20":3489.84,"cde25":4362.3,"hedge":{"hyperliquid":1744.92,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"ZEC","leg":"perp","notional":29822,"cde10":2982.2000000000003,"cde20":5964.400000000001,"cde25":7455.5,"hedge":{"hyperliquid":2982.2,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"AAVE","leg":"perp","notional":6814,"cde10":681.4000000000001,"cde20":1362.8000000000002,"cde25":1703.5,"hedge":{"hyperliquid":681.4,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"ONDO","leg":"perp","notional":8414.4,"cde10":841.44,"cde20":1682.88,"cde25":2103.6,"hedge":{"hyperliquid":841.4399999999999,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"ENA","leg":"perp","notional":11062.5,"cde10":1106.25,"cde20":2212.5,"cde25":2765.625,"hedge":{"hyperliquid":1106.25,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"NEAR","leg":"perp","notional":20234.5,"cde10":2023.45,"cde20":4046.9,"cde25":5058.625,"hedge":{"hyperliquid":2023.45,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"BTC","leg":"fut","notional":162252.02,"cde10":40563.005,"cde20":40563.005,"cde25":40563.005,"hedge":{"hyperliquid":4056.3005,"okx":1622.5202,"deribit":3245.0404,"kraken":32450.404,"coinbase":16225.202,"lighter":"unk"},"lev":{"hyperliquid":40,"okx":100,"deribit":50,"kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"ETH","leg":"fut","notional":52599.799999999996,"cde10":13149.949999999999,"cde20":13149.949999999999,"cde25":13149.949999999999,"hedge":{"hyperliquid":2103.9919999999997,"okx":525.9979999999999,"deribit":1051.9959999999999,"kraken":10519.96,"coinbase":5259.98,"lighter":"unk"},"lev":{"hyperliquid":25,"okx":100,"deribit":50,"kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"SOL","leg":"fut","notional":22002,"cde10":5500.5,"cde20":5500.5,"cde25":5500.5,"hedge":{"hyperliquid":1100.1,"okx":440.04,"deribit":"unk","kraken":4400.4,"coinbase":2200.2,"lighter":"unk"},"lev":{"hyperliquid":20,"okx":50,"deribit":"NA","kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"XRP","leg":"fut","notional":28118,"cde10":7029.5,"cde20":7029.5,"cde25":7029.5,"hedge":{"hyperliquid":1405.9,"okx":562.36,"deribit":"unk","kraken":5623.6,"coinbase":2811.8,"lighter":"unk"},"lev":{"hyperliquid":20,"okx":50,"deribit":"NA","kraken":5,"coinbase":10,"lighter":"unk"}},{"assetKey":"nBTC","leg":"fut","notional":40563.005,"cde10":10140.75125,"cde20":10140.75125,"cde25":10140.75125,"hedge":{"hyperliquid":1014.075125,"okx":405.63005,"deribit":811.2601,"kraken":8112.601,"coinbase":4056.3005,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"nETH","leg":"fut","notional":13149.949999999999,"cde10":3287.4874999999997,"cde20":3287.4874999999997,"cde25":3287.4874999999997,"hedge":{"hyperliquid":525.9979999999999,"okx":131.49949999999998,"deribit":262.99899999999997,"kraken":2629.99,"coinbase":1314.995,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"nSOL","leg":"fut","notional":16501.5,"cde10":4125.375,"cde20":4125.375,"cde25":4125.375,"hedge":{"hyperliquid":825.075,"okx":330.03,"deribit":"unk","kraken":3300.3,"coinbase":1650.15,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"nXRP","leg":"fut","notional":14059,"cde10":3514.75,"cde20":3514.75,"cde25":3514.75,"hedge":{"hyperliquid":702.95,"okx":281.18,"deribit":"unk","kraken":2811.8,"coinbase":1405.9,"lighter":"unk"},"lev":{"hyperliquid":"NA","okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"BCH","leg":"fut","notional":5014.8,"cde10":1253.7,"cde20":1253.7,"cde25":1253.7,"hedge":{"hyperliquid":501.48,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"LTC","leg":"fut","notional":5847.6,"cde10":1461.9,"cde20":1461.9,"cde25":1461.9,"hedge":{"hyperliquid":584.76,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"DOGE","leg":"fut","notional":8681.7,"cde10":2170.425,"cde20":2170.425,"cde25":2170.425,"hedge":{"hyperliquid":868.1700000000001,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"AVAX","leg":"fut","notional":4418.84,"cde10":1104.71,"cde20":1104.71,"cde25":1104.71,"hedge":{"hyperliquid":441.884,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"LINK","leg":"fut","notional":9988,"cde10":2497,"cde20":2497,"cde25":2497,"hedge":{"hyperliquid":998.8,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"SUI","leg":"fut","notional":7000.16,"cde10":1750.04,"cde20":1750.04,"cde25":1750.04,"hedge":{"hyperliquid":700.016,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"BNB","leg":"fut","notional":15356,"cde10":3839,"cde20":3839,"cde25":3839,"hedge":{"hyperliquid":1535.6,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"HYPE","leg":"fut","notional":18711,"cde10":4677.75,"cde20":4677.75,"cde25":4677.75,"hedge":{"hyperliquid":1871.1,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"DOT","leg":"fut","notional":1839.52,"cde10":459.88,"cde20":459.88,"cde25":459.88,"hedge":{"hyperliquid":183.952,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"XLM","leg":"fut","notional":19530,"cde10":4882.5,"cde20":4882.5,"cde25":4882.5,"hedge":{"hyperliquid":3906,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":5,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"kSHIB","leg":"fut","notional":2744,"cde10":686,"cde20":686,"cde25":686,"hedge":{"hyperliquid":274.4,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"HBAR","leg":"fut","notional":6813.04,"cde10":1703.26,"cde20":1703.26,"cde25":1703.26,"hedge":{"hyperliquid":1362.608,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":5,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}},{"assetKey":"ADA","leg":"fut","notional":4526.6,"cde10":1131.65,"cde20":1131.65,"cde25":1131.65,"hedge":{"hyperliquid":452.66,"okx":"unk","deribit":"unk","kraken":"unk","coinbase":"unk","lighter":"unk"},"lev":{"hyperliquid":10,"okx":"NA","deribit":"NA","kraken":"NA","coinbase":"NA","lighter":"unk"}}],"viability":{"via":{"BTC":{"v24":100,"n24":1437,"v7":96.22,"n7":10390},"ETH":{"v24":100,"n24":1438,"v7":100,"n7":10392},"SOL":{"v24":100,"n24":1438,"v7":100,"n7":10392},"XRP":{"v24":100,"n24":1438,"v7":100,"n7":10388},"nBTC":{"v24":99.86,"n24":1438,"v7":98.34,"n7":10389},"nETH":{"v24":100,"n24":1438,"v7":100,"n7":10390},"nSOL":{"v24":100,"n24":1438,"v7":100,"n7":10390},"nXRP":{"v24":100,"n24":1437,"v7":100,"n7":10388},"ADA":{"v24":100,"n24":1438,"v7":100,"n7":10389},"LTC":{"v24":96.18,"n24":1438,"v7":92.73,"n7":10388},"DOGE":{"v24":96.45,"n24":1438,"v7":95.12,"n7":10389},"AVAX":{"v24":100,"n24":1438,"v7":100,"n7":10389},"LINK":{"v24":99.72,"n24":1438,"v7":98.61,"n7":10388},"SUI":{"v24":99.24,"n24":1438,"v7":92.93,"n7":10388},"BNB":{"v24":81.08,"n24":1438,"v7":85.76,"n7":10388},"HYPE":{"v24":100,"n24":1438,"v7":100,"n7":10388},"DOT":{"v24":100,"n24":1438,"v7":100,"n7":10388},"XLM":{"v24":0.56,"n24":1437,"v7":2.58,"n7":10387},"kSHIB":{"v24":100,"n24":1438,"v7":99.95,"n7":10388},"HBAR":{"v24":2.23,"n24":1438,"v7":6.99,"n7":10388},"BCH":{"v24":97.64,"n24":1438,"v7":92.27,"n7":10388},"PAXG":{"v24":88.87,"n24":1438,"v7":95.32,"n7":10388},"ZEC":{"v24":89.5,"n24":1438,"v7":81.34,"n7":10388},"1kPEPE":{"v24":100,"n24":1436,"v7":99.99,"n7":10386},"AAVE":{"v24":25.24,"n24":1438,"v7":18.94,"n7":10388},"ONDO":{"v24":10.78,"n24":1438,"v7":7.5,"n7":10388},"ENA":{"v24":10.57,"n24":1438,"v7":11.04,"n7":10388},"NEAR":{"v24":18.64,"n24":1438,"v7":14.27,"n7":10388}},"empty":false,"generatedAt":"2026-09-20T19:30:17.518Z"}};
+const VENUE_SHORT = {hyperliquid:'HL',okx:'OKX',deribit:'DER',kraken:'KRK',coinbase:'CB',lighter:'LIT'};
+// per-token include state
+let included = {};
+DATA.rows.forEach(r=>{ included[r.assetKey]=true; });
+
+// build token checkbox list with master toggles: ALL / MAJORS / ALTS + individuals
+const toklist = document.getElementById('toklist');
+const allToks = [...new Set(DATA.rows.map(r=>r.assetKey))].sort();
+const majors = DATA.majors.filter(t=>allToks.includes(t));
+const alts = allToks.filter(t=>!majors.includes(t));
+function addMaster(label, id, toks){
+  const row=document.createElement('label'); row.className='tokrow master';
+  row.innerHTML='<input type="checkbox" id="'+id+'" checked> '+label;
+  toklist.appendChild(row);
+  document.getElementById(id).onchange=function(){
+    const v=this.checked;
+    toks.forEach(t=>{ included[t]=v; const c=document.querySelector('.tokchk[data-t="'+t+'"]'); if(c) c.checked=v; });
+    render();
+  };
+}
+addMaster('Include ALL','masterAll', allToks);
+addMaster('Majors only','masterMajors', majors);
+addMaster('Alts only','masterAlts', alts);
+allToks.forEach(t=>{
+  const row=document.createElement('label'); row.className='tokrow';
+  row.innerHTML='<input type="checkbox" class="tokchk" data-t="'+t+'" checked> '+t;
+  toklist.appendChild(row);
+});
+document.querySelectorAll('.tokchk').forEach(c=>{ c.onchange=function(){ included[this.dataset.t]=this.checked; render(); }; });
+
+const cdeCol=(row,leg,ratePerp,rateFut)=>{
+  const rate = leg==='fut'?rateFut:ratePerp;
+  if(rate==='lev2') return row.notional*0.50;   // 2x -> 50% IM
+  if(rate==='lev3') return row.notional*0.3333; // 3x -> 33% IM
+  return rate==='initialMarginRate'?row.cde10:rate==='conservativeRate'?row.cde20:row.cde25;
+};
+function hedgeFor(row, venue){
+  if(venue==='cheapest'){ let best=Infinity; for(const v of DATA.venues){const x=row.hedge[v]; if(typeof x==='number'&&x<best)best=x;} return best===Infinity?0:best; }
+  const x=row.hedge[venue]; return typeof x==='number'?x:0;
+}
+// resolve the leverage used for a row given the selected hedge venue (cheapest => lowest-lev venue)
+function levForRow(row, venue){
+  if(venue==='cheapest'){
+    let best=null, bestLev=Infinity;
+    for(const v of DATA.venues){ const l=row.lev[v]; if(typeof l==='number'&&l<bestLev){bestLev=l;best=v;} }
+    return { venue: best, lev: bestLev };
+  }
+  const l=row.lev[venue];
+  return { venue: venue, lev: (typeof l==='number'?l:null) };
+}
+const usd=n=>'$'+Math.round(n).toLocaleString();
+const viaCls=p=> p>=80?'via-hi':p>=50?'via-mid':p>=25?'via-lo':'via-vlo';
+const viaCell=p=> (p==null) ? '<span class="via-na">—</span>' : '<span class="'+viaCls(p)+'">'+p.toFixed(1)+'%</span>';
+const fmtH=(row,venue)=>{ const x=row.hedge[venue==='cheapest'?'hyperliquid':venue];
+  if(x==='unk')return 'n/a'; if(x==='NA')return '—'; return usd(x); };
+
+function render(){
+  const strat=document.getElementById('strategy').value || 'both';
+  const ratePerp=document.getElementById('cdeRatePerp').value || 'initialMarginRate';
+  const rateFut=document.getElementById('cdeRateFut').value || 'futuresRate';
+  const hv=document.getElementById('hedgeVenue').value || 'cheapest';
+  const legOk = l => strat==='both'||l===strat;
+  const rows = DATA.rows.filter(r=>included[r.assetKey]&&legOk(r.leg));
+  const tb=document.getElementById('tbody'); tb.innerHTML='';
+  let tCde=0,tH=0,tSwd=0,tSwe=0,tRorNum=0,tRorDen=0;
+  rows.forEach(r=>{
+    const cde=cdeCol(r,r.leg,ratePerp,rateFut)*2;
+    const h=hedgeFor(r,hv);
+    const lr=levForRow(r,hv);
+    const levTxt = (lr.lev!=null) ? (lr.lev+'x @'+VENUE_SHORT[lr.venue]) : 'n/a';
+    tCde+=cde; tH+=h;
+    const cdeUsd=usd(cde);
+    const hedgeCell=(hv==='cheapest')?usd(h):fmtH(r,hv);
+    const isAlt = !DATA.majors.includes(r.assetKey);
+    const st = DATA.stipend[r.leg][isAlt?'alt':'major'];
+    tSwd += st.weekday; tSwe += st.weekend;
+    const stipTotal = st.weekday + st.weekend;
+    const cap = cde + h;
+    const ror = cap > 0 ? (stipTotal / cap) : 0;
+    tRorNum += stipTotal; tRorDen += cap;
+    const via = (DATA.viability && DATA.viability.via && DATA.viability.via[r.assetKey]) || {};
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td>'+r.assetKey+'</td><td>'+r.leg+'</td><td>'+usd(r.notional)+'</td><td>'+cdeUsd+'</td><td>'+hedgeCell+'</td>'
+      +'<td>'+levTxt+'</td><td>'+usd(h*2)+'</td>'
+      +'<td>'+usd(st.weekday)+'</td><td>'+usd(st.weekend)+'</td>'
+      +'<td>'+(ror*100).toFixed(2)+'%</td>'
+      +'<td>'+viaCell(via.v24)+'</td><td>'+viaCell(via.v7)+'</td>';
+    tb.appendChild(tr);
+  });
+  const totRor = tRorDen>0 ? (tRorNum/tRorDen*100).toFixed(2)+'%' : '0.00%';
+  document.getElementById('totrow').innerHTML='<td>'+rows.length+' rows</td><td></td><td></td><td>'+usd(tCde)+'</td><td>'+usd(tH)+'</td><td></td><td></td><td>'+usd(tSwd)+'</td><td>'+usd(tSwe)+'</td><td>'+totRor+'</td><td></td><td></td>';
+  const rpName=ratePerp==='initialMarginRate'?'10x (10%)':'5x (20%)';
+  const rfName='4x (25%, futures)';
+  const hvName=hv==='cheapest'?'cheapest per token':VENUE_SHORT[hv];
+  const sumLines = [
+    'SUMMARY',
+    'Strategy: '+strat+'   CDE perp: '+rpName+'   CDE futures: '+rfName+'   Hedge: '+hvName,
+    'Post bid+offer on CDE (both sides): '+usd(tCde),
+    'Hedge one side: '+usd(tH),
+    'TOTAL CAPITAL REQUIRED: '+usd(tCde+tH)
+  ];
+  if (DATA.viability && DATA.viability.empty) {
+    sumLines.push('');
+    sumLines.push('Viability 24h/7d: NO LOG DATA YET — run the CDE MM SIM monitor to accrue stats.');
+  } else if (DATA.viability && DATA.viability.generatedAt) {
+    sumLines.push('Viability generated: ' + DATA.viability.generatedAt);
+  }
+  document.getElementById('summary').textContent = sumLines.join(String.fromCharCode(10));
+}
+['strategy','cdeRatePerp','cdeRateFut','hedgeVenue'].forEach(id=>document.getElementById(id).onchange=render);
+render();
+</script>
+</body></html>

@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CDE 24h Volume — Snapshot & Compare</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif;padding:20px;font-size:13px}
+h1{font-size:1.1rem;color:#58a6ff;margin-bottom:4px}
+.sub{color:#8b949e;font-size:0.78rem;margin-bottom:14px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
+button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px 14px;font-size:0.78rem;cursor:pointer}
+button:hover{background:#30363d}
+button.primary{background:#238636;border-color:#2ea043}
+button.primary:hover{background:#2ea043}
+button.danger{background:#da3633;border-color:#f85149}
+button.danger:hover{background:#f85149}
+select,input{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:5px;padding:5px 8px;font-size:0.78rem}
+.label{color:#8b949e;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em}
+.snap-bar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.snap-chip{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:4px 10px;font-size:0.72rem;color:#8b949e;cursor:pointer;display:flex;gap:6px;align-items:center}
+.snap-chip.active{border-color:#58a6ff;color:#58a6ff}
+.snap-chip .x{color:#f85149;cursor:pointer;font-weight:700}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;margin-top:10px}
+th,td{padding:5px 8px;border-bottom:1px solid #21262d;text-align:right;font-size:0.78rem}
+th{color:#8b949e;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;position:sticky;top:0;background:#161b22;cursor:pointer;user-select:none}
+th:hover{color:#58a6ff}
+td:nth-child(1),th:nth-child(1),td:nth-child(2),th:nth-child(2){text-align:left}
+tr:hover{background:#161b22}
+.pos{color:#3fb950}.neg{color:#f85149}.neu{color:#e6edf3}.dim{color:#8b949e}
+.vol-bar{display:inline-block;height:8px;border-radius:2px;background:#238636;margin-right:4px;vertical:middle}
+.vol-bar.dated{background:#58a6ff}
+.sect{margin-top:20px}
+.sect-title{font-size:0.85rem;color:#c9d1d9;margin-bottom:6px;font-weight:600}
+.status{font-size:0.72rem;color:#8b949e;margin-top:8px}
+</style>
+</head>
+<body>
+
+<h1>CDE 24h Volume — Snapshot &amp; Compare</h1>
+<p class="sub">Coinbase Derivatives Exchange · live 24h volume by contract · save snapshots to compare days</p>
+
+<div class="controls">
+  <button class="primary" id="btn-fetch" onclick="fetchLive()">Fetch Live</button>
+  <button id="btn-save" onclick="saveSnapshot()" disabled>Save Snapshot</button>
+  <span class="label">Compare:</span>
+  <select id="compare-select" onchange="renderCompare()">
+    <option value="">— select snapshot —</option>
+  </select>
+  <button class="danger" onclick="clearSnapshots()">Clear All</button>
+  <span class="label" style="margin-left:auto">Filter:</span>
+  <input id="filter" placeholder="token..." oninput="render()" style="width:80px">
+  <select id="type-filter" onchange="render()">
+    <option value="all">All</option>
+    <option value="perp">Perp only</option>
+    <option value="dated">Dated only</option>
+  </select>
+  <select id="expiry-filter" onchange="render()">
+    <option value="all">All expiries</option>
+    <option value="sep" selected>Sep only</option>
+    <option value="oct">Oct only</option>
+  </select>
+  <label style="display:flex;align-items:center;gap:4px;font-size:0.72rem;color:#8b949e;cursor:pointer">
+    <input type="checkbox" id="crypto-only" checked onchange="render()"> Crypto tokens only
+</div>
+
+<div class="snap-bar" id="snap-bar"></div>
+
+<div class="sect">
+  <div class="sect-title">Live Snapshot <span id="live-label" class="dim"></span></div>
+  <table id="live-table">
+    <thead><tr>
+      <th data-k="root">Token</th>
+      <th data-k="type">Type</th>
+      <th data-k="product_id">Contract</th>
+      <th data-k="price">Price</th>
+      <th data-k="price_change_24h">24h Chg</th>
+      <th data-k="volume_24h">24h Vol (ctr)</th>
+      <th data-k="volume_change_24h">Vol Chg</th>
+      <th data-k="funding_rate">Funding</th>
+    </tr></thead>
+    <tbody id="live-tbody"></tbody>
+  </table>
+</div>
+
+<div class="sect" id="compare-section" style="display:none">
+  <div class="sect-title">Comparison <span id="compare-label" class="dim"></span></div>
+  <table id="compare-table">
+    <thead><tr>
+      <th>Token</th>
+      <th>Type</th>
+      <th>Price A</th>
+      <th>Price B</th>
+      <th>Δ Price</th>
+      <th>Vol A</th>
+      <th>Vol B</th>
+      <th>Δ Vol</th>
+      <th>Δ Vol %</th>
+    </tr></thead>
+    <tbody id="compare-tbody"></tbody>
+  </table>
+</div>
+
+<p class="status" id="status">Click "Fetch Live" to load current CDE volume data</p>
+
+<script src="data/cde_embedded.js"></script>
+<script>
+const API = 'https://api.coinbase.com/api/v3/brokerage/market/products?product_type=FUTURE';
+const CRYPTO_TOKENS = new Set(['BTC','ETH','SOL','XRP','DOGE','LTC','AVAX','LINK','SUI','BNB','HYPE','DOT','XLM','SHIB','HBAR','BCH','ADA','AAVE','NEAR','ONDO','ENA','PEPE','PAXG','ZEC']);
+let liveData = null;
+let snapshots = JSON.parse(localStorage.getItem('cde_snapshots') || '[]');
+let embeddedLoaded = false;
+
+function fmt(n, d=2) { return n==null||isNaN(n)?'—':Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}) }
+function fmtPct(n) { return n==null||isNaN(n)?'—':(n>=0?'+':'')+n.toFixed(2)+'%' }
+function fmtVol(n) { return n==null||isNaN(n)?'—':Number(n).toLocaleString() }
+function fmtFunding(r) { return r==null?'—':(r>=0?'+':'')+(r*100).toFixed(4)+'%/hr' }
+function snapKey(s) { return s.date_label || s.generated_at.slice(0,16) }
+
+async function fetchLive() {
+  document.getElementById('status').textContent = 'Fetching...';
+  document.getElementById('btn-fetch').disabled = true;
+  try {
+    const res = await fetch(API + '&t=' + Date.now());
+    const data = await res.json();
+    liveData = parseProducts(data.products);
+    document.getElementById('live-label').textContent = liveData.generated_at.slice(0,16).replace('T',' ') + ' UTC (live)';
+    document.getElementById('btn-save').disabled = false;
+    render();
+    document.getElementById('status').textContent = 'Loaded ' + liveData.products.length + ' contracts from live API';
+  } catch(e) {
+    console.warn('Live fetch failed, loading embedded snapshot:', e.message);
+    // Fallback to embedded snapshot
+    if (typeof EMBEDDED_SNAPSHOT !== 'undefined') {
+      liveData = { ...EMBEDDED_SNAPSHOT };
+      document.getElementById('live-label').textContent = snapKey(liveData) + ' (embedded fallback)';
+      document.getElementById('btn-save').disabled = false;
+      render();
+      document.getElementById('status').textContent = 'Live API failed — loaded ' + liveData.products.length + ' contracts from embedded snapshot. Error: ' + e.message;
+    } else {
+      document.getElementById('status').textContent = 'Error: ' + e.message + ' — no embedded snapshot available';
+    }
+  }
+  document.getElementById('btn-fetch').disabled = false;
+}
+
+function parseProducts(products) {
+  const rows = products.map(p => {
+    const pid = p.product_id || '';
+    const parts = pid.replace('-CDE','').split('-');
+    const code = parts[0] || '';
+    const expiry = parts[1] || '';
+    const isPerp = expiry === '20DEC30' || expiry.includes('PERP');
+    const fpd = p.future_product_details || {};
+    return {
+      product_id: pid, code, expiry, is_perp: isPerp,
+      root: fpd.contract_root_unit || code,
+      price: parseFloat(p.price)||0,
+      price_change_24h: parseFloat(p.price_percentage_change_24h)||0,
+      volume_24h: parseFloat(p.volume_24h)||0,
+      volume_change_24h: parseFloat(p.volume_percentage_change_24h)||0,
+      funding_interval: fpd.funding_interval || '',
+      funding_rate: fpd.funding_rate ? parseFloat(fpd.funding_rate) : null,
+      contract_size: fpd.contract_size ? parseFloat(fpd.contract_size) : null
+    };
+  });
+  return { generated_at: new Date().toISOString(), products: rows };
+}
+
+function render() {
+  if (!liveData) return;
+  const filter = document.getElementById('filter').value.toLowerCase();
+  const typeFilter = document.getElementById('type-filter').value;
+  const expiryFilter = document.getElementById('expiry-filter').value;
+  const cryptoOnly = document.getElementById('crypto-only').checked;
+  let rows = liveData.products.filter(r => {
+    if (filter && !r.root.toLowerCase().includes(filter)) return false;
+    if (typeFilter === 'perp' && !r.is_perp) return false;
+    if (typeFilter === 'dated' && r.is_perp) return false;
+    if (expiryFilter === 'sep' && !r.expiry.match(/SEP26/)) return false;
+    if (expiryFilter === 'oct' && !r.expiry.match(/OCT26/)) return false;
+    if (cryptoOnly && !CRYPTO_TOKENS.has(r.root)) return false;
+    return true;
+  });
+  rows.sort((a,b) => b.volume_24h - a.volume_24h);
+
+  const tbody = document.getElementById('live-tbody');
+  tbody.innerHTML = rows.map(r => {
+    const volBar = r.volume_24h > 0 ? `<span class="vol-bar" style="width:${Math.min(60, Math.log10(r.volume_24h+1)*8)}px"></span>` : '';
+    return `<tr>
+      <td>${r.root}</td>
+      <td>${r.is_perp?'<span class="pos">Perp</span>':'<span class="dim">Dated</span>'}</td>
+      <td class="dim">${r.product_id}</td>
+      <td>${fmt(r.price)}</td>
+      <td class="${r.price_change_24h>=0?'pos':'neg'}">${fmtPct(r.price_change_24h)}</td>
+      <td>${volBar}${fmtVol(r.volume_24h)}</td>
+      <td class="${r.volume_change_24h>=0?'pos':'neg'}">${fmtPct(r.volume_change_24h)}</td>
+      <td class="${r.funding_rate>0?'pos':r.funding_rate<0?'neg':'neu'}">${fmtFunding(r.funding_rate)}</td>
+    </tr>`;
+  }).join('');
+  renderSnapBar();
+}
+
+function saveSnapshot() {
+  if (!liveData) return;
+  const snap = { ...liveData, date_label: new Date().toISOString().slice(0,16).replace('T',' ') + ' UTC' };
+  snapshots.unshift(snap);
+  if (snapshots.length > 10) snapshots.pop();
+  localStorage.setItem('cde_snapshots', JSON.stringify(snapshots));
+  renderSnapBar();
+  document.getElementById('status').textContent = 'Snapshot saved (' + snapshots.length + ' stored)';
+}
+
+function loadSnapshot(idx) {
+  const s = snapshots[idx];
+  if (!s) return;
+  compareAgainst(s);
+}
+
+function compareAgainst(snap) {
+  if (!liveData) { alert('Fetch live data first'); return; }
+  document.getElementById('compare-section').style.display = '';
+  document.getElementById('compare-label').textContent = snapKey(snap) + ' vs ' + snapKey(liveData);
+
+  // Aggregate by root+type
+  const aggA = {}, aggB = {};
+  for (const p of snap.products) {
+    const k = p.root + '|' + p.is_perp;
+    aggA[k] = { root: p.root, is_perp: p.is_perp, price: p.price, volume: p.volume_24h, funding: p.funding_rate };
+  }
+  for (const p of liveData.products) {
+    const k = p.root + '|' + p.is_perp;
+    aggB[k] = { root: p.root, is_perp: p.is_perp, price: p.price, volume: p.volume_24h, funding: p.funding_rate };
+  }
+
+  const keys = new Set([...Object.keys(aggA), ...Object.keys(aggB)]);
+  const rows = [];
+  for (const k of keys) {
+    const a = aggA[k], b = aggB[k];
+    const priceA = a ? a.price : null;
+    const priceB = b ? b.price : null;
+    const volA = a ? a.volume : 0;
+    const volB = b ? b.volume : 0;
+    const dPrice = (priceA != null && priceB != null) ? priceB - priceA : null;
+    const dVol = volB - volA;
+    const dPct = volA > 0 ? (dVol / volA * 100) : (volB > 0 ? 100 : 0);
+    rows.push({
+      root: (a||b).root, is_perp: (a||b).is_perp,
+      priceA, priceB, dPrice,
+      volA, volB, dVol, dPct
+    });
+  }
+  rows.sort((a,b) => Math.abs(b.dVol) - Math.abs(a.dVol));
+
+  document.getElementById('compare-tbody').innerHTML = rows.map(r => `
+    <tr>
+      <td>${r.root}</td>
+      <td>${r.is_perp?'<span class="pos">Perp</span>':'<span class="dim">Dated</span>'}</td>
+      <td>${fmt(r.priceA)}</td>
+      <td>${fmt(r.priceB)}</td>
+      <td class="${r.dPrice>0?'pos':r.dPrice<0?'neg':'neu'}">${r.dPrice!=null?fmt(r.dPrice):'—'}</td>
+      <td>${fmtVol(r.volA)}</td>
+      <td>${fmtVol(r.volB)}</td>
+      <td class="${r.dVol>0?'pos':'neg'}">${r.dVol>=0?'+':''}${fmtVol(r.dVol)}</td>
+      <td class="${r.dPct>0?'pos':'neg'}">${fmtPct(r.dPct)}</td>
+    </tr>
+  `).join('');
+}
+
+function renderSnapBar() {
+  const bar = document.getElementById('snap-bar');
+  const sel = document.getElementById('compare-select');
+  bar.innerHTML = '<span class="label">Snapshots:</span>' +
+    snapshots.map((s,i) => `<span class="snap-chip" onclick="loadSnapshot(${i})">${snapKey(s)} <span class="x" onclick="event.stopPropagation();deleteSnapshot(${i})">×</span></span>`).join('') +
+    (snapshots.length===0?'<span class="dim">none</span>':'');
+  sel.innerHTML = '<option value="">— select snapshot —</option>' +
+    snapshots.map((s,i) => `<option value="${i}">${snapKey(s)}</option>`).join('');
+}
+
+function deleteSnapshot(idx) {
+  snapshots.splice(idx,1);
+  localStorage.setItem('cde_snapshots', JSON.stringify(snapshots));
+  renderSnapBar();
+}
+
+function clearSnapshots() {
+  snapshots = [];
+  localStorage.removeItem('cde_snapshots');
+  renderSnapBar();
+  document.getElementById('compare-section').style.display = 'none';
+}
+
+function renderCompare() {
+  const idx = document.getElementById('compare-select').value;
+  if (idx !== '') loadSnapshot(parseInt(idx));
+}
+
+// Sortable tables (toggle asc/desc)
+let sortState = { key: null, asc: false };
+document.querySelectorAll('th[data-k]').forEach(th => {
+  th.onclick = () => {
+    const k = th.dataset.k;
+    if (!liveData) return;
+    if (sortState.key === k) {
+      sortState.asc = !sortState.asc;
+    } else {
+      sortState.key = k;
+      sortState.asc = k === 'root' || k === 'product_id';
+    }
+    liveData.products.sort((a,b) => {
+      const va = a[k], vb = b[k];
+      let cmp;
+      if (typeof va === 'string') cmp = va.localeCompare(vb);
+      else cmp = (va||0) - (vb||0);
+      return sortState.asc ? cmp : -cmp;
+    });
+    render();
+  };
+});
+
+renderSnapBar();
+</script>
+</body>
+</html>
