@@ -91,6 +91,7 @@ function buildSnapshot(futureProducts, spotProducts, opts = {}) {
       fundingSec: parseInterval(d.funding_interval), fundingRate: num(d.funding_rate),
       fundingTime: d.funding_time || null, index: num(d.index_price),
       contractSize: num(d.contract_size), oi: num(d.open_interest),
+      tickSize: num(p.quote_increment) || num(p.price_increment) || num(d.quote_increment) || num(d.tick_size) || null,
       vol24: num(p.approximate_quote_24h_volume),
     };
     (byRoot[root] = byRoot[root] || []).push(rec);
@@ -212,12 +213,12 @@ function buildSnapshot(futureProducts, spotProducts, opts = {}) {
     rows.push({
       root, hasDated: !!front, hasPerp: !!perp, hasBack: !!back,
       dated: front ? { productId: front.productId, code: front.code, F: front.mid, S: S_dated, Tms: front.Tms,
-        expiry: front.expiry, hoursToExpiry: frontHoursToExpiry, basisAPY, allInPct: allInDated, contractSize: front.contractSize, oi: front.oi, vol24: front.vol24 } : null,
+        expiry: front.expiry, hoursToExpiry: frontHoursToExpiry, basisAPY, allInPct: allInDated, contractSize: front.contractSize, tick: front.tickSize, oi: front.oi, vol24: front.vol24 } : null,
       back: back ? { productId: back.productId, code: back.code, F: back.mid, S: S_dated, Tms: back.Tms,
-        expiry: back.expiry, basisAPY: backBasisAPY, contractSize: back.contractSize, oi: back.oi, vol24: back.vol24 } : null,
+        expiry: back.expiry, basisAPY: backBasisAPY, contractSize: back.contractSize, tick: back.tickSize, oi: back.oi, vol24: back.vol24 } : null,
       perp: perp ? { productId: perp.productId, code: perp.code, P: perp.mid, S: S_perp, gapPct,
-        fundingRate: perp.fundingRate, fundingInterval: perp.fundingInterval, fundingTime: perp.fundingTime, fundAPY,
-        allInPct: allInPerp, contractSize: perp.contractSize, oi: perp.oi, vol24: perp.vol24 } : null,
+        fundingRate: perp.fundingRate, fundingSec: perp.fundingSec, fundingInterval: perp.fundingInterval, fundingTime: perp.fundingTime, fundAPY,
+        allInPct: allInPerp, contractSize: perp.contractSize, tick: perp.tickSize, oi: perp.oi, vol24: perp.vol24 } : null,
       hDays: +(hMs / DAY_MS).toFixed(2), divergence, termSlope, backPerpSpread, bestSpread, verdict, flags,
     });
   }

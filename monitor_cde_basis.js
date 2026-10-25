@@ -24,21 +24,19 @@
 //   CLI: node monitor_cde_basis.js [--once] [--port 8080] [--poll 30000] [--dryrun]
 //        [--horizon-days N] [--stats-window-days N]
 //
-// Env overrides: CDE_BASIS_PORT, CDE_BASIS_POLL_MS, CDE_BASIS_ONCE, CDE_BASIS_DRYRUN,
-//                CDE_BASIS_LOG, CDE_BASIS_HORIZON_DAYS, CDE_BASIS_STATS_WINDOW_DAYS.
+// Env overrides (all optional; can also live in a local .env file, never committed):
+//   CDE_BASIS_PORT, CDE_BASIS_POLL_MS, CDE_BASIS_ONCE, CDE_BASIS_DRYRUN, CDE_BASIS_LOG,
+//   CDE_BASIS_HORIZON_DAYS, CDE_BASIS_STATS_WINDOW_DAYS, CDE_BASIS_STALE_POLLS,
+//   CDE_BASIS_MAX_LOG_DAYS      (active-log retention before rotating older polls to data/archive/, default 60)
+//   CDE_BASIS_BOOK_TTL_MS / CDE_BASIS_BOOK_INTERVAL_MS   (Bid/Ask tab order-book cache and request pacing)
+//   CDE_ALERT_MAJORS / CDE_ALERT_MAJOR_APY / CDE_ALERT_ALT_APY / CDE_ALERT_CLEAR_APY   (alert defaults; editable live at /alerts/settings)
+//   CDE_BASIS_TELEGRAM_BOT_TOKEN / CDE_BASIS_TELEGRAM_CHAT_ID   (optional Telegram alerts; console-only if unset)
 //
-// KNOWN v1 PERF NOTE: stats are recomputed by re-reading the *entire* JSONL log
-// file on every poll. Fine for weeks/months of 30s-interval history (a few MB),
-// but will get slower as the log grows unbounded over a long deployment.
-// MITIGATION (done): loadLog now caches parsed entries by file mtime, so
-// within a poll cycle the 794MB file is read+parsed only once instead of
-// ~109 times. The single read/parse is ~12s; statsFromLog on cached entries
-// is ~87ms. For 100K+ polls the 1-call-per-cycle pattern keeps total poll
-// cycle well under the 30s interval.
-// LONG-TERM TODO: an in-memory rolling buffer updated incrementally, OR
-// periodic log rotation/rollup (mirror analysis/cde_viability_logger.js's
-// rollup() pattern) once the file exceeds ~1GB. Run with
-// node --max-old-space-size=8192 for headroom.
+// Tabs: Overview, Front vs Perp, Front vs Back, Term Structure, Bid/Ask (executable),
+//   My Positions (APY), Volume, Calibration, plus /chart?root=X, /alerts/settings.
+// Log growth: the stats/calibration code parses the whole active log, so the log is
+//   rotated automatically (analysis/cde_log_rotation.js) at startup and daily; nothing is deleted,
+//   older polls are moved to data/archive/.
 
 const http = require('http');
 const fs = require('fs');
@@ -72,6 +70,10 @@ const path = require('path');
   console.log('[cde-basis] loaded .env from', envPath);
 })();
 const { buildSnapshot, logPoll, LOG_PATH, SANITY_CAP_PCT } = require('./analysis/cde_basis');
+const calibration = require('./analysis/cde_basis_calibration');
+const { rotateLogIfNeeded } = require('./analysis/cde_log_rotation');
+const bidask = require('./analysis/cde_basis_bidask');
+const myPos = require('./analysis/cde_basis_positions');
 const { statsFromLog, historyFor, METRICS } = require('./analysis/cde_basis_stats');
 
 // ---------- "my positions" tracking (pin a token, see if it's converging or
@@ -170,6 +172,11 @@ const STATS_WINDOW_DAYS = (() => {
   const v = process.env.CDE_BASIS_STATS_WINDOW_DAYS || argv('--stats-window-days', '30');
   const n = parseFloat(v);
   return (!isNaN(n) && n > 0) ? n : 30;
+})();
+const MAX_ACTIVE_LOG_DAYS = (() => {
+  const v = process.env.CDE_BASIS_MAX_LOG_DAYS || argv('--max-log-days', '60');
+  const n = parseFloat(v);
+  return (!isNaN(n) && n > 0) ? n : 60;
 })();
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -298,18 +305,19 @@ const alertState = new Map(); // key -> { armed: boolean }
 
 function fmtApy(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 
-async function lookupZScore(root, metricKey, dayStats) {
+async function lookupZScore(root, metricKey) {
   try {
+    const dayStats = await statsFromLog(LOG_PATH, { windowDays: ALERT_ZSCORE_WINDOW_DAYS });
     const rec = dayStats.stats[root] && dayStats.stats[root][metricKey];
-    if (!rec) return 'insufficient history';
-    if (rec.z != null) return `${rec.z >= 0 ? '+' : ''}${rec.z.toFixed(2)}σ (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
-    return `not enough history yet (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
+    if (rec && rec.z != null) return `${rec.z >= 0 ? '+' : ''}${rec.z.toFixed(2)}σ (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
+    if (rec) return `not enough history yet (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
+    return 'insufficient history';
   } catch (e) {
     return `unavailable (${e.message})`;
   }
 }
 
-async function checkAlerts(snap, dayStats) {
+async function checkAlerts(snap) {
   for (const r of snap.rows) {
     // Never alert on data we've already decided not to trust for ranking —
     // an EXPIRING/STALE/SUSPECT reading is exactly the kind of thing that
@@ -332,7 +340,7 @@ async function checkAlerts(snap, dayStats) {
       if (!state.armed && mag >= entryThreshold) {
         state.armed = true;
         alertState.set(key, state);
-        const zTxt = await lookupZScore(r.root, def.metric, dayStats);
+        const zTxt = await lookupZScore(r.root, def.metric);
         const message =
           `🚨 <b>CDE Basis Alert — ${r.root}</b> (${isMajor ? 'major' : 'alt'}, entry ${entryThreshold}%)\n\n` +
           `<b>APY:</b> ${fmtApy(spread)} (${def.label})\n` +
@@ -344,7 +352,7 @@ async function checkAlerts(snap, dayStats) {
       } else if (state.armed && mag < exitThreshold) {
         state.armed = false;
         alertState.set(key, state);
-        const zTxt = await lookupZScore(r.root, def.metric, dayStats);
+        const zTxt = await lookupZScore(r.root, def.metric);
         const message =
           `✅ <b>CDE Basis Alert CLEARED — ${r.root}</b>\n\n` +
           `${def.label} has normalized: ${fmtApy(spread)}, below the ${exitThreshold}% exit threshold.\n` +
@@ -433,18 +441,8 @@ async function runCheck() {
     latest = snap;
     lastError = null;
     logPoll(snap);
-    // Compute 1-day stats ONCE for z-score lookups (previously, checkAlerts
-    // called statsFromLog 36×3=108 times per poll — once per token/pair, each
-    // re-reading and re-parsing the entire JSONL log). Now the file is read
-    // once (via the loadLog mtime cache) and the result is reused.
-    let dayStats = null;
     try {
-      dayStats = await statsFromLog(LOG_PATH, { windowDays: ALERT_ZSCORE_WINDOW_DAYS });
-    } catch (e) {
-      console.warn(`[${new Date().toISOString()}] day-stats for alerts failed: ${e.message}`);
-    }
-    try {
-      await checkAlerts(snap, dayStats);
+      await checkAlerts(snap);
     } catch (e) {
       console.warn('[cde-basis] checkAlerts failed:', e.message);
     }
@@ -582,7 +580,10 @@ const NAV_ITEMS = [
   ['/front-perp', 'Front vs Perp'],
   ['/front-back', 'Front vs Back'],
   ['/term-structure', 'Term Structure (all 3)'],
+  ['/bidask', 'Bid/Ask (executable)'],
+  ['/my-positions', 'My Positions (APY)'],
   ['/volume', 'Volume'],
+  ['/calibration', 'Calibration'],
 ];
 function navHTML(activePath) {
   const links = NAV_ITEMS.map(([href, label]) =>
@@ -856,6 +857,371 @@ ${hiddenBadgeHTML(hidden)}
 </body></html>`;
 }
 
+// ---------- My Positions: manually-entered positions ranked by the APY you're earning ----------
+// Uses the same mid-price APYs as the Overview / Front-vs-Perp tabs (perp = funding APY,
+// future = basis APY, spread = difference). Positions are saved to disk
+// (data/cde_basis_my_positions.json) and pinned to the specific contracts you
+// entered, so they survive restarts and contract expiries.
+const MY_POSITIONS_PATH = path.join(path.dirname(LOG_PATH), 'cde_basis_my_positions.json');
+
+function fmtUsdSigned(v) { return v == null ? '—' : `${v < 0 ? '−' : '+'}${fmtDollar(Math.abs(v))}`; }
+
+function myPositionsPageHTML(snap, errMsg) {
+  const esc = myPos.esc;
+  const positions = myPos.loadMyPositions(MY_POSITIONS_PATH);
+  const evals = myPos.rankEvaluated(myPos.evaluateAll(positions, snap.rows));
+  const sum = myPos.summarize(evals);
+  const options = {};
+  for (const r of snap.rows) { const a = myPos.availableInstruments(r); if (a.length) options[r.root] = a; }
+  const roots = Object.keys(options).sort();
+  const optsJson = JSON.stringify(options).replace(/</g, '\\u003c');
+
+  const rowHTML = (e) => {
+    const bad = e.status !== 'OK' || e.unreliable;
+    const statusTag = e.status === 'EXPIRED' ? ' <span class="neg">EXPIRED</span>'
+      : e.status !== 'OK' ? ` <span class="neg">no APY</span>`
+      : e.unreliable ? ' <span class="neg">(unreliable)</span>' : '';
+    const yourCls = e.yourApy == null ? '' : (e.yourApy >= 0 ? 'pos' : 'neg');
+    return `<tr data-bad="${bad ? 1 : 0}" data-token="${esc(e.root)}" data-mkt="${e.marketApy == null ? '' : e.marketApy}" data-your="${e.yourApy == null ? '' : e.yourApy}" data-notional="${e.notionalUsd == null ? '' : e.notionalUsd}" data-est="${e.estUsdYr == null ? '' : e.estUsdYr}"${bad ? ' style="opacity:.55"' : ''}>
+    <td class="root"><a href="/chart?root=${encodeURIComponent(e.root)}">${esc(e.root)}</a></td>
+    <td style="text-align:left" title="${esc(e.detail || e.reason || '')}">${esc(e.label)}${statusTag}${e.nowAs ? `<div class="meta" style="margin:0">now: ${esc(e.nowAs)}</div>` : ''}${e.reason ? `<div class="meta" style="margin:0">${esc(e.reason)}</div>` : ''}</td>
+    <td class="${e.side === 'LONG' ? 'perp' : 'fut'}">${e.side === 'LONG' ? 'Long' : 'Short'}</td>
+    <td>${e.notionalUsd == null ? '—' : fmtDollar(e.notionalUsd)}</td>
+    <td>${e.marketApy == null ? '—' : sgnPct(e.marketApy)}</td>
+    <td class="${yourCls}"><b>${e.yourApy == null ? '—' : sgnPct(e.yourApy)}</b></td>
+    <td class="${e.estUsdYr == null ? '' : (e.estUsdYr >= 0 ? 'pos' : 'neg')}">${fmtUsdSigned(e.estUsdYr)}</td>
+    <td style="text-align:left;color:#9ca3af">${esc(e.note)}</td>
+    <td style="text-align:left;white-space:nowrap">
+      <button type="button" class="editbtn" data-id="${esc(e.id)}" data-label="${esc(e.label)}" data-side="${esc(e.side)}" data-notional="${e.notionalUsd == null ? '' : e.notionalUsd}" data-note="${esc(e.note)}">edit</button>
+      <form method="POST" action="/my-positions/delete" class="hideform" onsubmit="return confirm('Delete this position?')"><input type="hidden" name="id" value="${esc(e.id)}"><button class="hidebtn" title="Delete position">✕</button></form>
+    </td>
+  </tr>`;
+  };
+  const body = evals.length ? evals.map(rowHTML).join('\n')
+    : '<tr><td colspan="9" class="empty">No positions yet — add one above.</td></tr>';
+  const sumLine = evals.length
+    ? `${sum.count} position${sum.count === 1 ? '' : 's'}` +
+      (sum.weightedCount ? ` · notional-weighted Your APY <b class="${sum.weightedYourApy >= 0 ? 'pos' : 'neg'}">${sgnPct(sum.weightedYourApy)}</b> across ${sum.weightedCount} with a notional (${fmtDollar(sum.totalNotional)}) · est. <b class="${sum.totalEstUsdYr >= 0 ? 'pos' : 'neg'}">${fmtUsdSigned(sum.totalEstUsdYr)}</b>/yr` : ' · add notionals to see a weighted average and $/yr') +
+      (sum.unscored ? ` · ${sum.unscored} not scored (expired, no data, or unreliable — excluded from the average)` : '')
+    : '';
+  const rootOpts = roots.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join('');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>My Positions — CDE Basis</title>
+<style>${SHARED_STYLE}
+  form#pform{background:#111827;border:1px solid #1f2937;border-radius:8px;padding:10px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  form#pform select, form#pform input[type=text]{background:#0b0e11;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:4px 6px;font:inherit}
+  form#pform button, button.editbtn{background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:4px 10px;font:inherit;cursor:pointer}
+  form#pform button.primary{background:#60a5fa;color:#0b0e11;border-color:#60a5fa;font-weight:600}
+  button.editbtn{padding:1px 6px;font-size:11px;color:#9ca3af}
+  button.editbtn:hover{color:#60a5fa}
+  th.srt{cursor:pointer;text-decoration:underline dotted #6b7280;user-select:none}
+  th.srt:hover{color:#60a5fa} th.srt.on{color:#0b0e11;background:#60a5fa}
+</style></head><body>
+${navHTML('/my-positions')}
+<h1>My Positions — ranked by the APY you're earning</h1>
+${errMsg ? `<div class="err">${esc(errMsg)}</div>` : ''}
+<form method="POST" action="/my-positions/save" id="pform">
+  <input type="hidden" name="id" id="f_id" value="">
+  <span id="pickers" style="display:contents">
+    <select name="root" id="f_root" required><option value="" disabled selected>— token —</option>${rootOpts}</select>
+    <select name="instrument" id="f_inst" required style="min-width:300px"><option value="" disabled selected>— instrument —</option></select>
+  </span>
+  <b id="editing" hidden></b>
+  <select name="side" id="f_side" required><option value="" disabled selected>— side —</option><option value="LONG">Long</option><option value="SHORT">Short</option></select>
+  <input type="text" name="notional" id="f_notional" placeholder="notional $ per leg (optional, e.g. 250k)" size="30" autocomplete="off">
+  <input type="text" name="note" id="f_note" placeholder="note (optional)" size="26" maxlength="120" autocomplete="off">
+  <button class="primary" id="f_submit">Add position</button>
+  <button type="button" id="f_cancel" hidden>Cancel edit</button>
+</form>
+<div class="meta">${sumLine}</div>
+<div class="sortnav"><b>Sorted by: <span id="sortlabel">…</span></b> <span style="color:#6b7280">(click an underlined header to change; best = highest Your APY)</span></div>
+<table id="t">
+<thead><tr><th class="srt" data-sort="token" style="text-align:left">Token</th><th style="text-align:left">Position</th><th>Side</th><th class="srt" data-sort="notional">Notional</th><th class="srt" data-sort="mkt">Market APY (mid)</th><th class="srt" data-sort="your">Your APY</th><th class="srt" data-sort="est">Est. $/yr</th><th style="text-align:left">Note</th><th></th></tr></thead>
+<tbody>${body}</tbody>
+</table>
+<div class="meta"><b>Market APY (mid)</b> is the same mid-price number the Overview and Front-vs-Perp tabs show: for a Perp it's the funding APY, for a future (1 = front, 2 = back) it's the basis APY vs the index, and for a spread it's first leg − second leg (1–Perp = front basis − perp funding, 2–Perp = back basis − perp funding, 1–2 = front basis − back basis; positive = the first leg is rich). <b>Your APY</b> is what you're actually earning: you <b>receive</b> when you're <b>short and the APY is positive</b>, or <b>long and it's negative</b>, so Your APY = Market APY if short, −Market APY if long. Positive/green = you're being paid; negative/red = you're paying. A <b>Long spread</b> is long the first leg and short the second. <b>Notional</b> is per leg; Est. $/yr = notional × Your APY. Rates move: funding changes each interval, and the basis APY will drift as expiry approaches. Positions are pinned to the exact contracts you picked — when a month expires the position shows EXPIRED rather than switching to the next month, and a position on Nov simply becomes the "1" once Oct is gone. Rows with under 24h to expiry, no data or an expired contract are dimmed and sorted last.</div>
+<script>
+(function(){
+  var OPTS = ${optsJson};
+  function sget(k){ try { return localStorage.getItem(k); } catch(e) { return null; } }
+  function sset(k,v){ try { localStorage.setItem(k,v); } catch(e) {} }
+  var $ = function(id){ return document.getElementById(id); };
+  var root=$('f_root'), inst=$('f_inst'), form=$('pform'), dirty=false;
+  function fillInst(){
+    inst.innerHTML = '<option value="" disabled selected>— instrument —</option>';
+    (OPTS[root.value] || []).forEach(function(o){ var e=document.createElement('option'); e.value=o.key; e.textContent=o.name; inst.appendChild(e); });
+  }
+  root.addEventListener('change', fillInst);
+  form.addEventListener('input', function(){ dirty = true; });
+  document.querySelectorAll('button.editbtn').forEach(function(b){
+    b.addEventListener('click', function(){
+      $('f_id').value = b.dataset.id;
+      $('pickers').style.display = 'none'; root.required = false; inst.required = false;
+      $('editing').hidden = false; $('editing').textContent = 'Editing: ' + b.dataset.label;
+      $('f_side').value = b.dataset.side; $('f_notional').value = b.dataset.notional; $('f_note').value = b.dataset.note;
+      $('f_submit').textContent = 'Save changes'; $('f_cancel').hidden = false; dirty = true;
+      form.scrollIntoView({behavior:'smooth', block:'center'});
+    });
+  });
+  $('f_cancel').addEventListener('click', function(){ location.href = '/my-positions'; });
+
+  var NAMES = { your: 'Your APY', mkt: 'Market APY', notional: 'Notional', est: 'Est. $/yr', token: 'Token' };
+  var sortKey = sget('cde_mypos_sort') || 'your', sortDir = sget('cde_mypos_dir') || 'desc';
+  var tbody = document.querySelector('#t tbody');
+  function applySort(){
+    var trs = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-token]'));
+    trs.sort(function(a, c){
+      if (a.dataset.bad !== c.dataset.bad) return a.dataset.bad === '1' ? 1 : -1;
+      if (sortKey === 'token') { var r = a.dataset.token.localeCompare(c.dataset.token); return sortDir === 'desc' ? -r : r; }
+      var av = parseFloat(a.dataset[sortKey]), cv = parseFloat(c.dataset[sortKey]), an = isNaN(av), cn = isNaN(cv);
+      if (an || cn) return (an && cn) ? 0 : (an ? 1 : -1);
+      return sortDir === 'desc' ? cv - av : av - cv;
+    });
+    trs.forEach(function(tr){ tbody.appendChild(tr); });
+    document.querySelectorAll('th.srt').forEach(function(th){
+      var on = th.dataset.sort === sortKey;
+      th.className = 'srt' + (on ? ' on' : '');
+      th.textContent = th.textContent.replace(/ [▲▼]$/, '') + (on ? (sortDir === 'desc' ? ' ▼' : ' ▲') : '');
+    });
+    $('sortlabel').textContent = NAMES[sortKey] + (sortKey === 'token' ? (sortDir === 'desc' ? ' — Z to A' : ' — A to Z') : (sortDir === 'desc' ? ' — highest first' : ' — lowest first'));
+  }
+  document.querySelectorAll('th.srt').forEach(function(th){
+    th.addEventListener('click', function(){
+      if (sortKey === th.dataset.sort) sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      else { sortKey = th.dataset.sort; sortDir = th.dataset.sort === 'token' ? 'asc' : 'desc'; }
+      sset('cde_mypos_sort', sortKey); sset('cde_mypos_dir', sortDir); applySort();
+    });
+  });
+  applySort();
+  setInterval(function(){
+    var a = document.activeElement;
+    if (dirty || (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName))) return;   // never reload under someone who's typing
+    location.reload();
+  }, 10000);
+})();
+</script>
+</body></html>`;
+}
+
+// ---------- Bid/Ask: spread APYs at EXECUTABLE prices ----------
+// Every other page prices legs at mid. This one pulls the live order book for
+// each leg (the bulk products list has empty bid/ask fields) and shows what the
+// spread annualizes to if you actually cross it: sell at the bid, buy at the
+// ask. Books are fetched on demand when this page loads and cached ~8s, so
+// nothing extra is polled while nobody is looking at it.
+// Spreads move far less than outright prices, so books are refreshed
+// leisurely: each is cached 30s and requests are paced 200ms apart (5/s), which
+// keeps a full ~75-book sweep (~15s) comfortably under Coinbase's rate limit.
+const BIDASK_PAGE_BUILD = 'columns-v8';
+const BOOK_INTERVAL_MS = parseInt(process.env.CDE_BASIS_BOOK_INTERVAL_MS || '') || 200;
+const BOOK_TTL_MS = parseInt(process.env.CDE_BASIS_BOOK_TTL_MS || '') || 30000;
+const BOOK_PAGE_REFRESH_S = Math.max(5, Math.round(BOOK_TTL_MS / 1000));
+// The page must never make a click feel dead: answer within ~0.7s with whatever
+// books are ready (the rest fill in on the next quick refresh), instead of
+// waiting for a whole sweep.
+const BOOK_PAGE_MAX_WAIT_MS = 700;
+const BOOK_LOADING_REFRESH_MS = 2000;
+// Keep books warm in the background for a while after the tab was last viewed,
+// so coming back to it is instant instead of a cold sweep. Stops by itself
+// (no requests at all) once nobody has looked for BOOK_WARM_WINDOW_MS.
+const BOOK_WARM_WINDOW_MS = 15 * 60 * 1000;
+let lastBookInterest = 0;
+function warmBooks() {
+  if (!latest || Date.now() - lastBookInterest > BOOK_WARM_WINDOW_MS) return;
+  bookFetcher.getBooks(bidask.productIdsNeeded(latest.rows, loadHidden()))
+    .catch(e => console.warn('[cde-basis] book warm-up failed:', e.message));
+}
+const bookFetcher = bidask.createBookFetcher((u) => fetchJSON(u), { minIntervalMs: BOOK_INTERVAL_MS, ttlMs: BOOK_TTL_MS, maxStaleMs: BOOK_TTL_MS * 4 });
+
+function sgnPct(v, d = 2) { return v == null ? '—' : `${v >= 0 ? '+' : ''}${(+v).toFixed(d)}%`; }
+// Spread prices are small and in the underlying's own units (AVAX: 0.03), so
+// show up to 5 significant digits and trim trailing zeros rather than using a
+// fixed decimal count.
+function fmtSpreadPx(v) { return v == null ? '—' : String(+(+v).toPrecision(5)); }
+const SPREAD_LABEL = { FRONT_PERP: '1–Perp', BACK_PERP: '2–Perp', FRONT_BACK: '1–2' };
+
+async function bidAskPageHTML(snap, hidden, pairFilter) {
+  const ids = bidask.productIdsNeeded(snap.rows, hidden);
+  // Don't make the page wait for a whole paced sweep: serve what's ready (plus
+  // last-good quotes) after a few seconds; the rest keeps loading in the
+  // background and the page re-checks quickly until everything is in.
+  lastBookInterest = Date.now();
+  const books = await bookFetcher.getBooks(ids, { maxWaitMs: BOOK_PAGE_MAX_WAIT_MS });
+  const loadingLegs = ids.filter(id => books.get(id) && books.get(id).error === 'loading').length;
+  // Failures that are worth retrying soon (timeouts, 429s, 5xx, network) vs.
+  // ones that are just the market's state (404 not listed, empty/one-sided book).
+  const transientFails = ids.filter(id => { const b = books.get(id); return b && b.error && b.error !== 'loading' && !/^HTTP 404|one-sided|empty book|crossed/.test(b.error); }).length;
+  const recheckMs = loadingLegs ? BOOK_LOADING_REFRESH_MS : (transientFails ? 5000 : BOOK_PAGE_REFRESH_S * 1000);
+  const built = bidask.buildBidAskRows(snap.rows, books, hidden);
+  const validFilters = ['ALL', 'FRONT_PERP', 'BACK_PERP', 'FRONT_BACK'];
+  const filt = validFilters.includes(pairFilter) ? pairFilter : 'ALL';
+  const rows = built.rows.filter(r => filt === 'ALL' || r.pair === filt);
+  const good = rows.filter(r => !r.error);
+  const bad = rows.filter(r => r.error && r.error !== 'loading');
+  // Default order mirrors what the in-browser script does after load: best
+  // immediate trade (funding included) first, unreliable rows last.
+  const bestOf = (r) => {
+    const f = r.pairFundAPY || 0;
+    return Math.max(r.bidLevel - f, -(r.askLevel - f));
+  };
+  good.sort((a, b) => (a.unreliable !== b.unreliable) ? (a.unreliable ? 1 : -1) : bestOf(b) - bestOf(a));
+  const filterLinks = validFilters.map(f => {
+    const label = f === 'ALL' ? 'All spreads' : { FRONT_PERP: '1–Perp (front vs perp)', BACK_PERP: '2–Perp (back vs perp)', FRONT_BACK: '1–2 (front vs back)' }[f];
+    return `<a href="/bidask?pair=${f}" class="${f === filt ? 'active' : ''}">${label}</a>`;
+  }).join(' ');
+  const rowHTML = (r) => {
+    const stale = r.maxBookAgeSec != null && r.maxBookAgeSec > 90;
+    const key = `${r.idA}|${r.idB}`;
+    const tag = `${r.root}${SPREAD_LABEL[r.pair]}`.replace('–', '-');
+    const spreadsTitle = `${r.nameA} minus ${r.nameB}; leg spreads ${r.spreadBpsA != null ? r.spreadBpsA.toFixed(1) : '?'} / ${r.spreadBpsB != null ? r.spreadBpsB.toFixed(1) : '?'} bps; book age ${r.maxBookAgeSec != null ? Math.max(0, r.maxBookAgeSec).toFixed(0) + 's' : '?'}`;
+    return `<tr data-fundpx="${r.fundPerCyclePx == null ? '' : r.fundPerCyclePx}" data-fundsec="${r.fundIntervalSec || ''}" data-token="${r.root}" data-tickknown="${r.tickFromTable ? 1 : 0}" data-tick0="${r.spreadTick == null ? '' : r.spreadTick}" data-ref="${r.refMid}" data-ann="${r.annFactor}" data-fund="${r.pairFundAPY == null ? 0 : r.pairFundAPY}" data-unrel="${r.unreliable ? 1 : 0}" data-key="${key}"${r.unreliable ? ' style="opacity:.45"' : ''}>
+    <td class="root"><a href="/chart?root=${encodeURIComponent(r.root)}">${r.root}</a>${hideButtonHTML(r.root)}</td>
+    <td title="${spreadsTitle}">${r.root}${SPREAD_LABEL[r.pair].replace('–', '-')}${stale ? ' <span class="neg">⚠stale</span>' : ''}${r.unreliable ? ' <span class="neg">(&lt;24h)</span>' : ''}</td>
+    <td>${fmtSpreadPx(r.spreadBid)}</td><td data-px="${r.spreadBid}"></td>
+    <td>${fmtSpreadPx(r.spreadAsk)}</td><td data-px="${r.spreadAsk}"></td>
+    <td><input class="tickin" size="8" title="Minimum price move for this token's spreads. Pre-filled with a guess from the quote's decimals; type the real tick and it is remembered for every spread of this token."></td><td data-role="tickapy">—</td><td data-role="fundtick">—</td>
+    <td data-role="fund">${r.pairFundAPY == null ? '—' : sgnPct(r.pairFundAPY)}</td>
+    <td><input class="mypx" data-out="b_${tag}" data-kind="bid" size="7" placeholder="bid"></td><td id="b_${tag}">—</td>
+    <td><input class="mypx" data-out="o_${tag}" data-kind="offer" size="7" placeholder="offer"></td><td id="o_${tag}">—</td>
+  </tr>`;
+  };
+  const body = good.length
+    ? good.map(rowHTML).join('\n')
+    : `<tr><td colspan="14" class="empty">${loadingLegs ? 'Loading order books…' : 'No spreads with live quotes on both legs right now.'}</td></tr>`;
+  const errBlock = bad.length
+    ? `<div class="meta">No usable quote for ${bad.length} spread(s): ${bad.map(r => `${r.root} ${SPREAD_LABEL[r.pair]} (${r.error})`).join(' · ')}</div>`
+    : '';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Bid/Ask — CDE Basis</title>
+<style>${SHARED_STYLE}
+  input.mypx{background:#0b0e11;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 4px;font:inherit;text-align:right}
+  input.mypx:focus{outline:1px solid #60a5fa}
+  input.tickin{background:#0b0e11;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 4px;font:inherit;text-align:right;width:7em}
+  td.best{white-space:nowrap}
+  th.srt{cursor:pointer;text-decoration:underline dotted #6b7280;user-select:none}
+  th.srt:hover{color:#60a5fa}
+  th.srt.on{color:#0b0e11;background:#60a5fa}
+</style></head><body>
+${navHTML('/bidask')}
+${hiddenBadgeHTML(hidden)}
+<h1>Spreads priced in APY — at the bid, the ask, and your own prices</h1>
+<div class="meta">Live leg order books · ${good.length} spreads shown · ${built.stats.legsOk} legs quoted, ${built.stats.legsFailed} without a quote${loadingLegs ? ` (${loadingLegs} still loading — requests are paced to stay under Coinbase's rate limit; this page re-checks every 2s until they're in)` : ''} · quotes up to ${built.rows.reduce((mx, r) => Math.max(mx, r.maxBookAgeSec || 0), 0).toFixed(0)}s old (legs are fetched in sequence, grouped by token) · refreshes every ${recheckMs / 1000}s${transientFails ? ` (retrying ${transientFails} leg${transientFails === 1 ? '' : 's'} that failed to load)` : ''} (paused while you're typing)</div>
+<div class="sortnav">${filterLinks} &nbsp;·&nbsp; <label><input type="checkbox" id="fundcb" checked> include perp funding in the APYs</label> &nbsp;·&nbsp; <b>Sorted by: <span id="sortlabel">…</span></b> <span style="color:#6b7280">(click an underlined header to change)</span> &nbsp;·&nbsp; <span style="color:#4b5563">page build ${BIDASK_PAGE_BUILD}</span></div>
+<table id="t">
+<thead><tr><th class="srt" data-sort="token" style="text-align:left">Token</th><th>Spread</th><th>Spread bid</th><th class="srt" data-sort="bid">Bid APY</th><th>Spread ask</th><th class="srt" data-sort="ask">Ask APY</th><th title="Minimum spread price move (tick). Editable, saved per token.">Tick</th><th class="srt" data-sort="tick" title="How much the spread's APY changes for one minimum price move (one tick)">APY per tick</th><th class="srt" data-sort="fundtick" title="Ticks of spread value from ONE funding payment if you BUY the spread (long first leg, short the perp) and hold through it. Positive = you receive, negative = you pay. Selling the spread is the opposite sign. 1–2 spreads have no perp, so no funding.">Funding / cycle (ticks)</th><th>Perp funding (1y)</th><th>My bid</th><th class="srt" data-sort="mybid">My bid APY</th><th>My offer</th><th class="srt" data-sort="myoffer">My offer APY</th></tr></thead>
+<tbody>${body}</tbody>
+</table>
+${errBlock}
+<div class="meta"><b>Spread</b> = first leg minus second leg, in price units, the same way your synthetic spreads are quoted (AVA1-Perp = AVAX front − AVAX perp; 2 = next month; 1–2 = front − back). <b>Spread bid</b> = bid of the first leg − ask of the second: the price you could sell the spread at right now by hitting both legs. <b>Spread ask</b> = ask of the first leg − bid of the second: the price you could buy it at right now. These should match the market shown on your synthetic spread ladders.<br>
+<b>APY</b> = spread price ÷ perp (or front) price, annualized over the time until the legs converge (front expiry for 1–Perp, back expiry for 2–Perp, the gap between expiries for 1–2). Higher = richer front/back. With the funding box ticked, the perp's current funding rate is subtracted, so the number is a "rich vs. perp including funding" level comparable to the Rich/Cheap % on the other tabs. Type a spread price in <b>My bid</b> / <b>My offer</b> to see its APY (saved in this browser). <b>Click any underlined APY header to sort by it</b> (click again to flip high/low); rows where you haven't typed a price always sink to the bottom when sorting by your own prices. <b>Funding / cycle (ticks)</b> = one perp funding payment at the current rate (rate × perp price), expressed in spread ticks, for buying the spread (long the first leg, short the perp). Positive: you'd be paid that many ticks for holding through the next payment; negative: you'd pay. Sell the spread and it flips. It uses the rate as of now, which can change before the payment, and the Tick box, so correct ticks matter. <b>APY per tick</b> = how many APY points the spread moves for one minimum price move (<b>Tick</b> is pre-filled from CDE's published minimum tick per contract; for a token not in that list it is a guess from the quote's decimals. You can overwrite any tick; it is saved and applies to all of that token's spreads). This tab prices spreads leg-to-leg (future price vs perp price), so it will not exactly match the other tabs, which measure each leg against the index.</div>
+<script>
+(function(){
+  function sget(k){ try { return localStorage.getItem(k); } catch(e) { return null; } }
+  function sset(k,v){ try { localStorage.setItem(k,v); } catch(e) {} }
+  var cb = document.getElementById('fundcb');
+  var savedF = sget('cde_bidask_fund'); if (savedF !== null) cb.checked = savedF === '1';
+  function fmt(v){ return (v>=0?'+':'') + v.toFixed(2) + '%'; }
+  function lvl(tr, price){
+    var l = price / (+tr.dataset.ref) * (+tr.dataset.ann);
+    if (cb.checked) l -= (+tr.dataset.fund || 0);
+    return l;
+  }
+  var tbody = document.querySelector('#t tbody');
+  var sortKey = sget('cde_bidask_sort') || 'bid';
+  if (['bid','ask','tick','fundtick','token','mybid','myoffer'].indexOf(sortKey) < 0) sortKey = 'bid';
+  var sortDir = sget('cde_bidask_dir') || 'desc';
+  function recalc(doSort){
+    var trs = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-ref]'));
+    trs.forEach(function(tr){
+      var v = { bid: NaN, ask: NaN, mybid: NaN, myoffer: NaN, tick: NaN, fundtick: NaN, token: tr.dataset.token };
+      var names = ['bid', 'ask'];
+      tr.querySelectorAll('td[data-px]').forEach(function(td, i){
+        var p = parseFloat(td.dataset.px);
+        if (isNaN(p)) { td.textContent = '—'; return; }
+        v[names[i]] = lvl(tr, p);
+        td.textContent = fmt(v[names[i]]);
+      });
+      var ti = tr.querySelector('input.tickin');
+      if (ti && !ti._init) {
+        ti._init = true;
+        var sv = sget('cde_bidask_tick:' + tr.dataset.token);
+        ti.value = (sv !== null && sv !== '') ? sv : (tr.dataset.tick0 || '');
+        ti.addEventListener('input', function(){
+          sset('cde_bidask_tick:' + tr.dataset.token, ti.value);
+          tbody.querySelectorAll('tr[data-token="' + tr.dataset.token + '"] input.tickin').forEach(function(o){ if (o !== ti) o.value = ti.value; });
+          recalc(false);
+        });
+        ti.addEventListener('change', function(){ recalc(true); });
+      }
+      var tk = ti ? parseFloat(ti.value) : NaN, tcell = tr.querySelector('td[data-role="tickapy"]');
+      if (!isNaN(tk) && tk > 0) { v.tick = tk / (+tr.dataset.ref) * (+tr.dataset.ann); tcell.textContent = '±' + v.tick.toFixed(2) + '%'; }
+      else tcell.textContent = '—';
+      var fcell = tr.querySelector('td[data-role="fundtick"]'), fpx = parseFloat(tr.dataset.fundpx);
+      if (!isNaN(fpx) && !isNaN(tk) && tk > 0) {
+        v.fundtick = fpx / tk;
+        var fs = (+tr.dataset.fundsec) ? ' per ' + ((+tr.dataset.fundsec) % 3600 === 0 ? ((+tr.dataset.fundsec) / 3600) + 'h' : (+tr.dataset.fundsec) + 's') + ' payment' : '';
+        fcell.textContent = (v.fundtick >= 0 ? '+' : '') + (Math.abs(v.fundtick) >= 100 ? v.fundtick.toFixed(0) : v.fundtick.toFixed(2));
+        fcell.className = v.fundtick >= 0 ? 'pos' : 'neg';
+        fcell.title = 'Buying this spread receives ' + (fpx >= 0 ? '+' : '') + fpx.toPrecision(3) + ' in spread price' + fs + ' (= ' + v.fundtick.toFixed(2) + ' ticks). Selling pays the opposite.';
+      } else { fcell.textContent = '—'; fcell.className = ''; fcell.title = ''; }
+      tr.querySelectorAll('input.mypx').forEach(function(inp){
+        var out = document.getElementById(inp.dataset.out), p = parseFloat(inp.value);
+        if (inp.value.trim() === '' || isNaN(p)) { out.textContent = '—'; return; }
+        var l = lvl(tr, p);
+        v[inp.dataset.kind === 'bid' ? 'mybid' : 'myoffer'] = l;
+        out.textContent = fmt(l);
+      });
+      tr._v = v;
+    });
+    document.querySelectorAll('th.srt').forEach(function(th){
+      var on = th.dataset.sort === sortKey;
+      th.className = 'srt' + (on ? ' on' : '');
+      th.textContent = th.textContent.replace(/ [▲▼]$/, '') + (on ? (sortDir === 'desc' ? ' ▼' : ' ▲') : '');
+    });
+    var SORT_NAMES = { token: 'Token', bid: 'Bid APY', ask: 'Ask APY', tick: 'APY per tick', fundtick: 'Funding per cycle (ticks)', mybid: 'My bid APY', myoffer: 'My offer APY' };
+    var sl = document.getElementById('sortlabel');
+    if (sl) sl.textContent = (SORT_NAMES[sortKey] || sortKey) + (sortKey === 'token' ? (sortDir === 'desc' ? ' — Z to A' : ' — A to Z') : (sortDir === 'desc' ? ' — highest first' : ' — lowest first'));
+    if (doSort === false) return;   // don't reorder rows while the user is mid-typing
+    trs.sort(function(a, c){
+      if (a.dataset.unrel !== c.dataset.unrel) return a.dataset.unrel === '1' ? 1 : -1;
+      if (sortKey === 'token') { var r = a._v.token.localeCompare(c._v.token) || a.dataset.key.localeCompare(c.dataset.key); return sortDir === 'desc' ? -r : r; }
+      var av = a._v[sortKey], cv = c._v[sortKey], an = isNaN(av), cn = isNaN(cv);
+      if (an || cn) return (an && cn) ? 0 : (an ? 1 : -1);   // blanks always last
+      return sortDir === 'desc' ? cv - av : av - cv;
+    });
+    trs.forEach(function(tr){ tbody.appendChild(tr); });
+  }
+  document.querySelectorAll('th.srt').forEach(function(th){
+    th.title = 'Click to sort by this column; click again to flip';
+    th.addEventListener('click', function(){
+      if (sortKey === th.dataset.sort) sortDir = (sortDir === 'desc') ? 'asc' : 'desc';
+      else { sortKey = th.dataset.sort; sortDir = (sortKey === 'token') ? 'asc' : 'desc'; }
+      sset('cde_bidask_sort', sortKey); sset('cde_bidask_dir', sortDir);
+      recalc(true);
+    });
+  });
+  tbody.querySelectorAll('tr[data-key]').forEach(function(tr){
+    tr.querySelectorAll('input.mypx').forEach(function(inp){
+      var v = sget('cde_bidask:' + tr.dataset.key + ':' + inp.dataset.kind);
+      if (v !== null) inp.value = v;
+      inp.addEventListener('input', function(){
+        sset('cde_bidask:' + tr.dataset.key + ':' + inp.dataset.kind, inp.value);
+        recalc(false);
+      });
+      inp.addEventListener('change', function(){ recalc(true); });
+    });
+  });
+  cb.addEventListener('change', function(){ sset('cde_bidask_fund', cb.checked ? '1' : '0'); recalc(true); });
+  recalc(true);
+  setInterval(function(){
+    var a = document.activeElement;
+    if (!(a && a.tagName === 'INPUT' && a.type === 'text')) location.reload();
+  }, ${recheckMs});
+})();
+</script>
+</body></html>`;
+}
+
 // ---------- Volume summary: average daily volume across every token ----------
 // Reuses latestStats (already computed each poll) directly — frontVol/backVol
 // are ordinary logged metrics, so their mean/std/n come for free from the
@@ -926,6 +1292,134 @@ function volumeCSV() {
     r.backN,
   ].join(','));
   return [header, ...lines].join('\n') + '\n';
+}
+
+// ---------- Calibration: measures real market behavior from the logged
+// history, to replace guessed simulator parameters with real ones as
+// history accumulates. Not filtered by hidden tokens — hiding is a display
+// preference, not a signal that a token shouldn't count toward calibrating
+// overall market behavior. ----------
+function fmtDays(v) { return v == null ? '—' : v.toFixed(2) + 'd'; }
+function fmtPerDay(v) { return v == null ? '—' : v.toFixed(2) + '/day'; }
+
+async function calibrationPageHTML() {
+  const panel = await calibration.loadPanel(LOG_PATH);
+  const nav = navHTML('/calibration');
+
+  if (panel.length < 50) {
+    return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Calibration — CDE Basis</title>
+<style>${SHARED_STYLE}</style></head><body>
+${nav}
+<h1>Calibration</h1>
+<div class="empty">Only ${panel.length} polls logged so far — not enough history yet to compute meaningful statistics (need at least 50). Check back once the monitor has been running longer.</div>
+</body></html>`;
+  }
+
+  const spanDays = (panel[panel.length - 1].tMs - panel[0].tMs) / 86_400_000;
+  // Use the CURRENTLY CONFIGURED alert thresholds as the default lens, so
+  // this page stays consistent with whatever /alerts/settings has live —
+  // change the thresholds there and this page's numbers follow.
+  const entryThreshold = alertSettings.altThreshold;
+  const exitThreshold = alertSettings.clearThreshold;
+
+  const arrivals = calibration.arrivalStats(panel, entryThreshold);
+  const persistence = calibration.persistenceStats(panel);
+  const epStats = calibration.episodeStats(panel, entryThreshold, exitThreshold);
+  const corr = calibration.correlationStats(panel);
+  const replay = calibration.replayRolls(panel, {
+    entryThreshold, exitThreshold, assumedHoldDays: 1,
+    notional: 100000, leverage: 5, makerFee: 0.04, takerFee: 0.06, contractsPerLeg: 200,
+  });
+
+  const topArrivals = [...arrivals.perSeries].sort((a, b) => (b.perDay || 0) - (a.perDay || 0)).slice(0, 8);
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Calibration — CDE Basis</title>
+<style>${SHARED_STYLE}
+  .calgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:16px}
+  .calcard{background:#111827;border:1px solid #1f2937;border-radius:8px;padding:14px}
+  .calcard .lab{font-size:10px;text-transform:uppercase;color:#6b7280;margin-bottom:6px}
+  .calcard .big{font-size:20px;font-weight:700}
+  .calcard .sub{font-size:11px;color:#9ca3af;margin-top:4px}
+  .simbox{background:#111827;border:1px solid #60a5fa;border-radius:8px;padding:14px;margin-bottom:16px;font-size:12px;color:#9ca3af;line-height:1.7}
+  .simbox b{color:#60a5fa}
+</style></head><body>
+${nav}
+<h1>Calibration</h1>
+<div class="meta">Measures real market behavior directly from ${panel.length} logged polls spanning ${spanDays.toFixed(1)} days — no new data source, this is the same log the dashboard already writes to. Uses the currently configured alert thresholds (entry ${entryThreshold}%, exit ${exitThreshold}%) from <a href="/alerts/settings">Alert Settings</a> as the lens for these calculations.</div>
+${spanDays < 14 ? `<div class="err">Only ${spanDays.toFixed(1)} days of history — these numbers will move around a lot as more data accumulates. Treat everything below as provisional, not a settled calibration, until you have at least a few weeks.</div>` : ''}
+
+<h2>Arrival rate — how often does something cross the entry bar</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Any of the 51 spreads</div>
+    <div class="big">${fmtPerDay(arrivals.aggregate.perDay)}</div>
+    <div class="sub">${arrivals.aggregate.crossings} crossings over ${arrivals.aggregate.spanDays.toFixed(1)}d — this is "how often will we find A good trade"</div>
+  </div>
+</div>
+<table>
+<thead><tr><th>Token</th><th>Pair</th><th>Crossings</th><th>Per day</th></tr></thead>
+<tbody>${topArrivals.map(a => `<tr><td class="root">${a.root}</td><td>${a.pairKey}</td><td>${a.crossings}</td><td>${fmtPerDay(a.perDay)}</td></tr>`).join('\n')}</tbody>
+</table>
+
+<h2>Persistence — how fast a rich spread decays (empirical half-life)</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Median half-life</div>
+    <div class="big">${fmtDays(persistence.summary.medianHalfLifeDays)}</div>
+    <div class="sub">across ${persistence.summary.nEstimable} series with enough data (${persistence.summary.nLowConfidence} flagged low-confidence — near-random-walk, treat with caution)</div>
+  </div>
+  <div class="calcard">
+    <div class="lab">Mean half-life</div>
+    <div class="big">${fmtDays(persistence.summary.meanHalfLifeDays)}</div>
+  </div>
+</div>
+
+<h2>Episode duration — how long a qualifying opportunity actually lasts</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Median duration</div>
+    <div class="big">${fmtDays(epStats.summary.medianDurationDays)}</div>
+    <div class="sub">${epStats.summary.nClosedEpisodes} closed episodes, ${epStats.summary.nStillOpen} still open at end of log</div>
+  </div>
+  <div class="calcard">
+    <div class="lab">Mean duration</div>
+    <div class="big">${fmtDays(epStats.summary.meanDurationDays)}</div>
+  </div>
+</div>
+
+<h2>Roll frequency — replaying the real roll rule against real history</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Rolls / month (projected)</div>
+    <div class="big">${replay.rollsPerMonth != null ? replay.rollsPerMonth.toFixed(1) : '—'}</div>
+    <div class="sub">${replay.rolls} actual rolls, ${replay.entries} entries, ${replay.exits} exits over ${replay.spanDays.toFixed(1)}d</div>
+  </div>
+  <div class="calcard">
+    <div class="lab">Median hold between transitions</div>
+    <div class="big">${fmtDays(replay.medianHoldDaysBetweenTransitions)}</div>
+    <div class="sub">mean: ${fmtDays(replay.meanHoldDaysBetweenTransitions)}</div>
+  </div>
+</div>
+
+<h2>Correlation across spreads</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Mean pairwise correlation</div>
+    <div class="big">${corr.mean != null ? corr.mean.toFixed(2) : '—'}</div>
+    <div class="sub">median ${corr.median != null ? corr.median.toFixed(2) : '—'} · P10 ${corr.p10 != null ? corr.p10.toFixed(2) : '—'} · P90 ${corr.p90 != null ? corr.p90.toFixed(2) : '—'} · ${corr.nPairs} pairs with enough overlap</div>
+  </div>
+</div>
+
+<div class="simbox">
+  <b>What to plug into the simulator</b><br>
+  Mean-reversion half-life: <b>${fmtDays(persistence.summary.medianHalfLifeDays)}</b> (simulator's "Mean-reversion half-life" slider)<br>
+  Correlation: <b>${corr.mean != null ? corr.mean.toFixed(2) : '—'}</b> (simulator's "Correlation across spreads" slider)<br>
+  Assumed holding period: <b>${fmtDays(replay.medianHoldDaysBetweenTransitions)}</b> (simulator's "Expected holding period" slider — this replaces the earlier 1-day guess with a real measurement)<br>
+  <span style="color:#6b7280">These are measurements from ${spanDays.toFixed(1)} days of real history, not guarantees about the future — revisit this page periodically as more data accumulates, especially after living through a genuinely different volatility regime.</span>
+</div>
+</body></html>`;
 }
 
 // ---------- "My Positions" panel: pinned tokens with entry vs. current ----------
@@ -1493,9 +1987,80 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/my-positions') {
+    res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
+    if (!latest) { res.end('<p>loading… <a href="/">back to dashboard</a></p>'); return; }
+    res.end(myPositionsPageHTML(latest, (url.searchParams.get('err') || '').slice(0, 300)));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/my-positions/save') {
+    const body = parseFormBody(await readBody(req));
+    const back = (err) => {
+      res.statusCode = 303;
+      res.setHeader('location', '/my-positions' + (err ? '?err=' + encodeURIComponent(err) : ''));
+      res.end();
+    };
+    if (!latest) return back('Market data is still loading — try again in a few seconds.');
+    const positions = myPos.loadMyPositions(MY_POSITIONS_PATH);
+    if (body.id) {
+      const idx = positions.findIndex(p => p.id === body.id);
+      if (idx < 0) return back('That position no longer exists.');
+      const r = myPos.buildPosition(body, latest.rows, positions[idx]);
+      if (r.error) return back(r.error);
+      positions[idx] = r.position;
+    } else {
+      if (positions.length >= myPos.MAX_POSITIONS) return back(`Limit of ${myPos.MAX_POSITIONS} positions reached.`);
+      const r = myPos.buildPosition(body, latest.rows);
+      if (r.error) return back(r.error);
+      positions.push(r.position);
+    }
+    try { myPos.saveMyPositions(MY_POSITIONS_PATH, positions); }
+    catch (e) { return back('Could not save: ' + e.message); }
+    return back(null);
+  }
+
+  if (req.method === 'POST' && url.pathname === '/my-positions/delete') {
+    const body = parseFormBody(await readBody(req));
+    const positions = myPos.loadMyPositions(MY_POSITIONS_PATH).filter(p => p.id !== body.id);
+    try { myPos.saveMyPositions(MY_POSITIONS_PATH, positions); } catch (e) { console.warn('[cde-basis] delete position failed:', e.message); }
+    res.statusCode = 303; res.setHeader('location', '/my-positions'); res.end();
+    return;
+  }
+
+  if (url.pathname === '/api/my-positions') {
+    res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store');
+    const evals = latest ? myPos.rankEvaluated(myPos.evaluateAll(myPos.loadMyPositions(MY_POSITIONS_PATH), latest.rows)) : [];
+    res.end(JSON.stringify({ positions: evals, summary: myPos.summarize(evals) }));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/bidask') {
+    res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
+    if (!latest) { res.end('<p>loading… <a href="/">back to dashboard</a></p>'); return; }
+    try {
+      res.end(await bidAskPageHTML(latest, loadHidden(), (url.searchParams.get('pair') || 'ALL').toUpperCase()));
+    } catch (e) {
+      res.statusCode = 500;
+      res.end(`<p>Bid/Ask page failed: ${e.message}</p>`);
+    }
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/volume') {
     res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
     res.end(volumePageHTML(loadHidden()));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/calibration') {
+    res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
+    try {
+      res.end(await calibrationPageHTML());
+    } catch (e) {
+      res.statusCode = 500;
+      res.end(`<p>Calibration failed: ${e.message}</p>`);
+    }
     return;
   }
 
@@ -1600,25 +2165,52 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ---- Why-did-it-stop diagnostics -------------------------------------------
+// A silent return to the prompt is hard to debug, so say what ended the process.
+function installDiagnostics() {
+  const ts = () => new Date().toISOString();
+  const mem = () => { const m = process.memoryUsage(); return `rss=${(m.rss / 1048576).toFixed(0)}MB heap=${(m.heapUsed / 1048576).toFixed(0)}MB`; };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
+    try { process.on(sig, () => { console.log(`[${ts()}] [cde-basis] received ${sig} (${mem()}), shutting down`); process.exit(0); }); } catch (e) { /* signal not supported on this OS */ }
+  }
+  process.on('uncaughtException', (e) => { console.error(`[${ts()}] [cde-basis] UNCAUGHT EXCEPTION (${mem()}):`, e && e.stack || e); process.exit(1); });
+  process.on('unhandledRejection', (e) => { console.error(`[${ts()}] [cde-basis] UNHANDLED REJECTION (kept running):`, e && e.stack || e); });
+  process.on('beforeExit', (code) => { console.error(`[${ts()}] [cde-basis] event loop became empty (code ${code}, ${mem()}) - nothing left to run`); });
+  process.on('exit', (code) => { console.error(`[${ts()}] [cde-basis] process exiting with code ${code} (${mem()})`); });
+  // Heartbeat so a log shows the monitor was alive, and memory growth over time.
+  setInterval(() => console.log(`[${ts()}] [cde-basis] alive ${mem()} lastError=${lastError || 'none'}`), 10 * 60_000).unref();
+}
+
 async function start() {
+  installDiagnostics();
   console.log(`[cde-basis] port=${PORT} poll=${POLL_MS}ms once=${ONCE} dryrun=${DRYRUN} statsWindowDays=${STATS_WINDOW_DAYS}`);
   console.log(`[cde-basis] alerts: majors=[${alertSettings.majors.join(',')}] majorThreshold=${alertSettings.majorThreshold}% altThreshold=${alertSettings.altThreshold}% (editable at /alerts/settings) telegram=${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? 'configured' : 'NOT CONFIGURED (console-only)'}`);
   console.log(`[cde-basis] log=${LOG_PATH}`);
-  if (fs.existsSync(LOG_PATH)) {
-    const sz = fs.statSync(LOG_PATH).size;
-    if (sz > 50 * 1024 * 1024) {
-      console.warn(`[cde-basis] WARNING: log is ${(sz / 1024 / 1024).toFixed(0)} MB — stats recomputation reloads the full file each poll cycle. Consider rotation (see data/rollup pattern in analysis/cde_viability_logger.js) or run with node --max-old-space-size=8192.`);
+
+  try {
+    const rot = await rotateLogIfNeeded(LOG_PATH, MAX_ACTIVE_LOG_DAYS);
+    if (rot.rotated) {
+      console.log(`[cde-basis] rotated log: kept ${rot.kept} recent polls, archived ${rot.archived} older polls to ${rot.archivePath}${rot.corrupt ? ` (${rot.corrupt} corrupt lines dropped)` : ''}`);
     }
+  } catch (e) {
+    console.warn('[cde-basis] log rotation check failed (continuing anyway):', e.message);
   }
+
   await runCheck();
   if (ONCE) { console.log('[cde-basis] --once: exiting after one poll'); process.exit(0); }
   server.listen(PORT, '127.0.0.1', () => console.log(`[cde-basis] dashboard http://localhost:${PORT}`));
   setInterval(() => runCheck().catch(e => console.warn('poll error:', e.message)), POLL_MS);
+  setInterval(warmBooks, Math.round(BOOK_TTL_MS / 2));
+  setInterval(() => {
+    rotateLogIfNeeded(LOG_PATH, MAX_ACTIVE_LOG_DAYS)
+      .then(rot => { if (rot.rotated) console.log(`[cde-basis] rotated log: kept ${rot.kept}, archived ${rot.archived}`); })
+      .catch(e => console.warn('[cde-basis] periodic rotation check failed:', e.message));
+  }, 24 * 3600_000);
 }
 
 if (require.main === module) start();
 else module.exports = {
-  runCheck, buildSnapshot, fetchJSON, server, applyStaleFlags, checkAlerts, lookupZScore,
+  runCheck, buildSnapshot, fetchJSON, server, applyStaleFlags, checkAlerts,
   _setLatestForTest: (s) => { latest = s; },
   _setLatestStatsForTest: (s) => { latestStats = s; },
   _resetStaleStateForTest: () => { for (const k of Object.keys(lastMid)) delete lastMid[k]; },

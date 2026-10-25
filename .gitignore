@@ -19,3 +19,5 @@ Thumbs.db
 # Debug
 dbg*.cjs
 debug.js
+data/archive/
+data/*.unreadable-*
