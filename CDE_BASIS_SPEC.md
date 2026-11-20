@@ -90,8 +90,11 @@ GET https://api.coinbase.com/api/v3/brokerage/market/products?product_type=SPOT
 
 ## GROUP 3 — CONTRACT SPECS (verified universe)
 
-- **100 futures total**: 29 perp-style (hourly funding) + 71 dated.
+- **100 futures total**: perp-style (hourly funding) + dated; split by `funding_interval`, not
+  `contract_expiry_type`. The dated count varies per pull (observed 71 and 90 across samples) —
+  do not hardcode it. Perp-style = those with a non-empty `funding_interval` ("3600s" = hourly).
 - **17 both (dated + perp):** ADA, AVAX, BCH, BNB, BTC, DOGE, DOT, ETH, HBAR, HYPE, LINK, LTC, SHIB, SOL, SUI, XLM, XRP
+  *(counts shift across API pulls — the dated leg count was 71 at first sample, 90 at next; the code does not hardcode these.)*
 - **12 perp-only:** AAVE, ENA, NEAR, ONDO, PAXG, PEPE, ZEC + 5 synth (CDEAI, CDECHN, CDEDEF, CDETEK, CDEUS5)
 - **7 dated-only synth (NO spot, NO perp):** CDECU, CDEGLD, CDEMC, CDENGS, CDEOIL, CDEPT, CDESIL → `NO_S`, out of scope.
 - **BNB has both** (BNF dated + BNB-20DEC30 perp). ADA/DOGE/DOT/XLM/HBAR/BCH all have perps.

@@ -23,23 +23,8 @@ const MIN_N_FOR_Z = 5; // fewer points than this -> z is not meaningful yet
 // Reads the JSONL file line-by-line (tolerant of a trailing partial line from
 // a poll that was interrupted mid-write) and returns parsed entries in file
 // order: [{ t: ISOString, tokens: { ROOT: {v,bApy,fApy,gap,aD,aP,div,fl} } }, ...]
-// In-memory cache: re-reads the file only when its mtime or size changes on
-// disk. Within a single poll cycle, statsFromLog is called many times in quick
-// succession (once per token×pair for z-score lookups, plus once for the
-// dashboard cache) — without this cache each call re-reads and re-parses the
-// ENTIRE JSONL log, which is O(N) per call and O(N²) per cycle. The cache
-// turns that into O(N) once per cycle.
-let logCache = { path: null, mtimeMs: null, entries: [] };
-
 async function loadLog(logPath) {
-  if (!fs.existsSync(logPath)) {
-    logCache = { path: null, mtimeMs: null, entries: [] };
-    return [];
-  }
-  const stat = fs.statSync(logPath);
-  if (logCache.path === logPath && logCache.mtimeMs === stat.mtimeMs && logCache.entries !== null) {
-    return logCache.entries;
-  }
+  if (!fs.existsSync(logPath)) return [];
   const entries = [];
   const rl = readline.createInterface({
     input: fs.createReadStream(logPath, { encoding: 'utf8' }),
@@ -55,7 +40,6 @@ async function loadLog(logPath) {
       // than aborting the whole read
     }
   }
-  logCache = { path: logPath, mtimeMs: stat.mtimeMs, entries };
   return entries;
 }
 
@@ -167,31 +151,154 @@ function rollup(series) {
   return out;
 }
 
+// ---- streaming log scan (memory-safe) ----
+// The old path parsed EVERY line of the log into objects and held them all
+// (plus a {t,v} object per data point) just to compute a handful of numbers,
+// every 30s, twice. With weeks of history that is gigabytes of heap and ends in
+// a fatal out-of-memory crash. These helpers read the file in chunks, keep
+// nothing but bare numbers, and only parse lines inside the requested window.
+
+// Calls onLine(str) for each COMPLETE (newline-terminated) line starting at
+// byte `startOffset`. Resolves to the byte offset just after the last complete
+// line, so a later call can continue from there (incremental reads).
+function scanLines(logPath, startOffset, onLine) {
+  return new Promise((resolve, reject) => {
+    let size;
+    try { size = fs.statSync(logPath).size; } catch (e) { return e.code === 'ENOENT' ? resolve(0) : reject(e); }
+    if (startOffset >= size) return resolve(startOffset);
+    let offset = startOffset;       // bytes consumed through last complete line
+    let carry = Buffer.alloc(0);
+    const rs = fs.createReadStream(logPath, { start: startOffset, end: size - 1, highWaterMark: 1 << 20 });
+    rs.on('error', reject);
+    rs.on('data', (chunk) => {
+      let buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+      let from = 0, nl;
+      while ((nl = buf.indexOf(10, from)) !== -1) {
+        const line = buf.toString('utf8', from, nl);
+        offset += (nl - from) + 1;
+        from = nl + 1;
+        onLine(line);
+      }
+      carry = from < buf.length ? Buffer.from(buf.subarray(from)) : Buffer.alloc(0);
+    });
+    rs.on('end', () => resolve(offset));
+  });
+}
+
+const T_PREFIX = /^\s*\{\s*"t"\s*:\s*"([^"]+)"/;
+// Parse a line only if it could be inside the window. Returns the entry,
+// null for blank/corrupt lines, or undefined for "valid but too old, skipped".
+function parseLineInWindow(line, sinceMs) {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  if (sinceMs != null) {
+    const m = T_PREFIX.exec(trimmed);
+    if (m) { const tMs = Date.parse(m[1]); if (!isNaN(tMs) && tMs < sinceMs) return undefined; }
+  }
+  try { return JSON.parse(trimmed); } catch { return null; }
+}
+
+function newAcc() { return { vals: {}, latestT: {}, polls: 0 }; }
+function ingestEntry(acc, entry, sinceMs) {
+  const t = entry.t, tMs = Date.parse(t);
+  if (sinceMs != null && !isNaN(tMs) && tMs < sinceMs) return;
+  for (const [root, rec] of Object.entries(entry.tokens || {})) {
+    let r = acc.vals[root];
+    if (!r) { r = acc.vals[root] = {}; acc.latestT[root] = {}; for (const m of METRICS) r[m] = []; }
+    for (const m of METRICS) {
+      const v = rec[m];
+      if (v != null && !isNaN(v) && (!PCT_METRICS.includes(m) || Math.abs(v) <= SANITY_CAP_PCT)) { r[m].push(v); acc.latestT[root][m] = t; }
+    }
+  }
+}
+
+const PCT_SAMPLE_CAP = 30000; // percentiles come from an even sample above this many points
+function summarize(vals, latestT) {
+  const n = vals.length;
+  if (n === 0) return { n: 0, latest: null, latestT: null, mean: null, std: null, z: null, min: null, max: null, p10: null, p50: null, p90: null };
+  let sum = 0, mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < n; i++) { const v = vals[i]; sum += v; if (v < mn) mn = v; if (v > mx) mx = v; }
+  const mu = sum / n;
+  let sd = null;
+  if (n >= 2) { let acc = 0; for (let i = 0; i < n; i++) acc += (vals[i] - mu) ** 2; sd = Math.sqrt(acc / (n - 1)); }
+  let sample = vals;
+  if (n > PCT_SAMPLE_CAP) { const step = n / PCT_SAMPLE_CAP; sample = new Array(PCT_SAMPLE_CAP); for (let i = 0; i < PCT_SAMPLE_CAP; i++) sample[i] = vals[Math.floor(i * step)]; }
+  const sorted = Float64Array.from(sample).sort();
+  const latest = vals[n - 1];
+  const z = (n >= MIN_N_FOR_Z && sd != null && sd > 0) ? (latest - mu) / sd : null;
+  return { n, latest, latestT: latestT || null, mean: mu, std: sd, z, min: mn, max: mx,
+    p10: percentile(sorted, 10), p50: percentile(sorted, 50), p90: percentile(sorted, 90) };
+}
+function rollupAcc(acc) {
+  const out = {};
+  for (const [root, metrics] of Object.entries(acc.vals)) {
+    out[root] = {};
+    for (const m of METRICS) out[root][m] = summarize(metrics[m], acc.latestT[root][m]);
+  }
+  return out;
+}
+
 // ---- convenience: log file -> full stats in one call ----
 // opts.windowDays: only include polls from the last N days (default: all history)
+// The accumulated numbers are cached per (file, window): each call reads only
+// the bytes appended since the last one, and everything is rebuilt from scratch
+// every 30 minutes (ages old points out of the window) or if the file shrank
+// (log rotation). Calls for the same key are serialized.
+const REBUILD_MS = 30 * 60_000;
+const _statsCache = new Map();
 async function statsFromLog(logPath, opts = {}) {
-  const entries = await loadLog(logPath);
-  const sinceMs = opts.windowDays != null ? Date.now() - opts.windowDays * 86_400_000 : null;
-  const series = buildSeries(entries, { sinceMs });
-  return { generatedAt: new Date().toISOString(), n: entries.length, windowDays: opts.windowDays ?? null, stats: rollup(series) };
+  const key = logPath + '|' + (opts.windowDays ?? 'all');
+  let st = _statsCache.get(key);
+  if (!st) { st = { acc: null, offset: 0, builtAt: 0, polls: 0, result: null, resultOffset: -1, chain: Promise.resolve() }; _statsCache.set(key, st); }
+  const run = st.chain.then(async () => {
+    let size = 0;
+    try { size = fs.statSync(logPath).size; } catch { size = 0; }
+    const now = Date.now();
+    if (!st.acc || size < st.offset || now - st.builtAt > REBUILD_MS) {
+      st.acc = newAcc(); st.offset = 0; st.polls = 0; st.builtAt = now; st.result = null;
+    }
+    const sinceMs = opts.windowDays != null ? now - opts.windowDays * 86_400_000 : null;
+    st.offset = await scanLines(logPath, st.offset, (line) => {
+      const e = parseLineInWindow(line, sinceMs);
+      if (e === null) return;
+      st.polls++;
+      if (e !== undefined) ingestEntry(st.acc, e, sinceMs);
+    });
+    if (!st.result || st.resultOffset !== st.offset) {
+      st.result = { generatedAt: new Date().toISOString(), n: st.polls, windowDays: opts.windowDays ?? null, stats: rollupAcc(st.acc) };
+      st.resultOffset = st.offset;
+    }
+    return st.result;
+  });
+  st.chain = run.catch(() => {});
+  return run;
 }
 
 // history for a single root/metric, for charting — returns [{t, v}, ...]
+// Streams the log and keeps only this one token's points.
 async function historyFor(logPath, root, opts = {}) {
-  const entries = await loadLog(logPath);
   const sinceMs = opts.windowDays != null ? Date.now() - opts.windowDays * 86_400_000 : null;
-  const series = buildSeries(entries, { sinceMs });
-  const metrics = series[root] || {};
-  const out = {};
-  for (const m of METRICS) out[m] = metrics[m] || [];
-  out.frontExpiry = metrics.frontExpiry || [];
+  const out = {}; for (const m of METRICS) out[m] = [];
+  out.frontExpiry = [];
+  await scanLines(logPath, 0, (line) => {
+    const e = parseLineInWindow(line, sinceMs);
+    if (!e) return;
+    const tMs = Date.parse(e.t);
+    if (sinceMs != null && !isNaN(tMs) && tMs < sinceMs) return;
+    const rec = e.tokens && e.tokens[root];
+    if (!rec) return;
+    for (const m of METRICS) {
+      const v = rec[m];
+      if (v != null && !isNaN(v) && (!PCT_METRICS.includes(m) || Math.abs(v) <= SANITY_CAP_PCT)) out[m].push({ t: e.t, v });
+    }
+    if (rec.frontExpiry != null) out.frontExpiry.push({ t: e.t, v: rec.frontExpiry });
+  });
   return out;
 }
 
 module.exports = {
   METRICS, MIN_N_FOR_Z,
-  loadLog, loadLogSync, buildSeries,
+  loadLog, loadLogSync, buildSeries, scanLines, parseLineInWindow,
   mean, stdev, percentile, rollup,
   statsFromLog, historyFor,
-  _purgeLogCache: () => { logCache = { path: null, mtimeMs: null, entries: [] }; },
 };
