@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CDE Basis-Rotation Monte Carlo Simulator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0e11; --surface: #111827; --border: #1f2937;
+    --text: #c9d1d9; --text-muted: #6b7280; --text-secondary: #9ca3af;
+    --blue: #60a5fa; --green: #34d399; --red: #f87171; --amber: #fbbf24; --gold: #c9a86a;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.5 -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 24px 0 10px; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  .subtitle { color: var(--text-muted); font-size: 12px; margin-bottom: 20px; }
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+  .field label { display: block; font-size: 11px; color: var(--text-secondary); margin-bottom: 5px; }
+  .field .hint { font-size: 10px; color: var(--text-muted); margin-top: 3px; }
+  .field input[type=number], .field input[type=text] {
+    width: 100%; padding: 6px 8px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--text); font: inherit; font-size: 13px;
+  }
+  .field input[type=range] { width: 100%; }
+  .field .val { font-size: 13px; font-weight: 600; color: var(--blue); }
+  .runbar { display: flex; align-items: center; gap: 14px; margin: 20px 0; }
+  button#runBtn {
+    background: var(--blue); color: #0b0e11; border: none; border-radius: 6px;
+    padding: 10px 22px; font-size: 14px; font-weight: 700; cursor: pointer;
+  }
+  button#runBtn:hover { background: #93c5fd; }
+  button#runBtn:disabled { background: var(--text-muted); cursor: wait; }
+  .runstatus { font-size: 12px; color: var(--text-muted); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card .lab { font-size: 10px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 6px; }
+  .card .big { font-size: 22px; font-weight: 700; }
+  .card .sub { font-size: 11px; color: var(--text-secondary); margin-top: 4px; }
+  .pos { color: var(--green); } .neg { color: var(--red); }
+  table.results { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 16px; }
+  table.results th, table.results td { padding: 6px 10px; border: 1px solid var(--border); text-align: right; }
+  table.results th { background: var(--surface); color: var(--text-secondary); font-weight: 600; }
+  table.results td:first-child, table.results th:first-child { text-align: left; }
+  .caveats { background: var(--surface); border: 1px solid var(--amber); border-radius: 8px; padding: 14px; font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+  .caveats b { color: var(--amber); }
+  .caveats ul { margin: 8px 0 0; padding-left: 20px; }
+  canvas { max-height: 340px; }
+  details summary { cursor: pointer; color: var(--blue); font-size: 12px; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+
+<h1>CDE Basis-Rotation Monte Carlo Simulator</h1>
+<div class="subtitle">Simulates one calendar month at a time, across all 17 CDE-listed alt tokens x 3 possible pairwise spreads (front↔perp, front↔back, back↔perp), applying the roll strategy and comparing to a flat BTC-basis control.</div>
+
+<h2>Trade economics</h2>
+<div class="panel grid">
+  <div class="field">
+    <label>Notional per trade ($)</label>
+    <input type="number" id="notional" value="100000" step="10000">
+  </div>
+  <div class="field">
+    <label>Leverage: <span class="val" id="leverage-out">5</span>x</label>
+    <input type="range" id="leverage" min="3" max="10" step="1" value="5">
+  </div>
+  <div class="field">
+    <label>Avg contract notional ($)</label>
+    <input type="number" id="contractNotional" value="2500" step="100">
+    <div class="hint">Derives contracts/leg = (notional x leverage) / this value.</div>
+  </div>
+  <div class="field">
+    <label>Maker fee ($/contract)</label>
+    <input type="number" id="makerFee" value="0.04" step="0.01">
+  </div>
+  <div class="field">
+    <label>Taker fee ($/contract)</label>
+    <input type="number" id="takerFee" value="0.06" step="0.01">
+  </div>
+  <div class="field">
+    <label>Monthly maker rebate pool ($)</label>
+    <input type="number" id="poolSize" value="100000" step="10000">
+  </div>
+  <div class="field">
+    <label>Assumed total market monthly maker contracts</label>
+    <input type="number" id="marketMakerContracts" value="2000000" step="100000">
+    <div class="hint">Placeholder — we don't know the real market total. Your pool share = your maker contracts / this number. Adjust to calibrate against a known real payout if you have one.</div>
+  </div>
+</div>
+
+<h2>Strategy rules</h2>
+<div class="panel grid">
+  <div class="field">
+    <label>Entry threshold: <span class="val" id="entryThreshold-out">25</span>%</label>
+    <input type="range" id="entryThreshold" min="5" max="60" step="1" value="25">
+  </div>
+  <div class="field">
+    <label>Exit / de-risk threshold: <span class="val" id="exitThreshold-out">10</span>%</label>
+    <input type="range" id="exitThreshold" min="0" max="30" step="1" value="10">
+    <div class="hint">Only used when NO replacement trade qualifies either — otherwise you just roll straight into the better one.</div>
+  </div>
+  <div class="field">
+    <label>Assumed holding period for a new trade: <span class="val" id="assumedHoldDays-out">1</span> day(s)</label>
+    <input type="range" id="assumedHoldDays" min="0.25" max="10" step="0.25" value="1">
+    <div class="hint">Used only in the roll-vs-stay cost/benefit comparison.</div>
+  </div>
+  <div class="field">
+    <label>Fill probability: <span class="val" id="fillProb-out">75</span>%</label>
+    <input type="range" id="fillProb" min="25" max="100" step="5" value="75">
+    <div class="hint">Chance a qualifying entry/roll actually executes when it's checked.</div>
+  </div>
+</div>
+
+<h2>Market model</h2>
+<div class="panel grid">
+  <div class="field">
+    <label>Base APY level (majors, calm): <span class="val" id="baseApyLevel-out">10</span>%</label>
+    <input type="range" id="baseApyLevel" min="2" max="30" step="1" value="10">
+    <div class="hint">Alts get a 1.3-1.7x liquidity-tier multiplier on top of this automatically.</div>
+  </div>
+  <div class="field">
+    <label>Market regime multiplier: <span class="val" id="regimeMultiplier-out">1.0</span>x</label>
+    <input type="range" id="regimeMultiplier" min="0.3" max="3" step="0.1" value="1.0">
+    <div class="hint">Scales every spread's typical level at once — calm month vs. hot/turbulent month.</div>
+  </div>
+  <div class="field">
+    <label>Mean-reversion half-life: <span class="val" id="halfLifeDays-out">3</span> days</label>
+    <input type="range" id="halfLifeDays" min="0.25" max="15" step="0.25" value="3">
+    <div class="hint">How fast a rich spread decays back toward its own typical level.</div>
+  </div>
+  <div class="field">
+    <label>Daily volatility (% of level): <span class="val" id="dailyVolPct-out">40</span>%</label>
+    <input type="range" id="dailyVolPct" min="5" max="100" step="5" value="40">
+  </div>
+  <div class="field">
+    <label>Correlation across spreads: <span class="val" id="rho-out">0.30</span></label>
+    <input type="range" id="rho" min="0" max="1" step="0.05" value="0.3">
+    <div class="hint">0 = every spread moves independently. 1 = they all move together.</div>
+  </div>
+</div>
+
+<h2>Simulation controls</h2>
+<div class="panel grid">
+  <div class="field">
+    <label>Number of Monte Carlo paths (months)</label>
+    <input type="number" id="numPaths" value="1000" step="100" min="10" max="10000">
+    <div class="hint">More paths = smoother distribution, slower run. A few thousand is usually enough.</div>
+  </div>
+  <div class="field">
+    <label>Random seed</label>
+    <input type="number" id="seed" value="2026" step="1">
+    <div class="hint">Same seed + same settings always reproduces the exact same result.</div>
+  </div>
+  <div class="field">
+    <label>BTC control APY (%)</label>
+    <input type="number" id="btcControlApy" value="12.5" step="0.1">
+    <div class="hint">Same margin and leverage, held flat all month, no rolling, no fees.</div>
+  </div>
+</div>
+
+<div class="runbar">
+  <button id="runBtn">Run simulation</button>
+  <span class="runstatus" id="runStatus"></span>
+</div>
+
+<div id="resultsArea" style="display:none;">
+  <h2>Results</h2>
+  <div class="cards" id="summaryCards"></div>
+  <table class="results" id="resultsTable"></table>
+  <canvas id="histChart"></canvas>
+</div>
+
+<h2>Modeling assumptions — read before trusting a number</h2>
+<div class="caveats">
+  This tool has <b>not been calibrated against real market data yet</b> — the CDE basis monitor's own log is only a few weeks old, nowhere near enough to have lived through genuinely different volatility regimes. Everything below is a reasonable starting assumption, not a measured fact:
+  <ul>
+    <li><b>Mean-reversion speed, volatility, and correlation</b> are estimated, not fit to real history. As the monitor accumulates more data, these should be re-calibrated against actual observed behavior.</li>
+    <li><b>Maker rebate pool</b> uses a placeholder for the total market's monthly maker volume, since that's not something we can observe from our own data alone — only your own maker volume. Adjust "assumed total market monthly maker contracts" if you get a real number.</li>
+    <li><b>FRONT_BACK legs</b> (both legs are dated futures, no perp involved) are modeled with the same 1-maker + 1-taker fee structure as the perp-involving pairs for simplicity. In reality both legs of a front-back spread could potentially be executed as maker, which would change that pair's economics somewhat.</li>
+    <li><b>Slippage</b> is not separately modeled — per your stated execution approach (maker on the illiquid leg, taker hedge immediately after fill), it's assumed to be small and effectively captured within the stated fee structure. If real fills show meaningfully more slippage than that, costs here are understated.</li>
+    <li><b>"Frequency of new opportunities arriving"</b> isn't a separate input — it emerges from the volatility, correlation, and mean-reversion settings together (with 51 simultaneously-evolving spreads, something crossing the entry bar is usually just a matter of time). Avg rolls/month is reported as an output, not set directly.</li>
+  </ul>
+</div>
+
+<script>
+// ---------- embedded simulation engine (verified in Node before shipping) ----------
+const TOKENS = ['BTC','ETH','SOL','XRP','ADA','LTC','DOGE','AVAX','LINK','SUI','BNB','HYPE','DOT','XLM','SHIB','HBAR','BCH'];
+const PAIRS = ['FRONT_PERP', 'FRONT_BACK', 'BACK_PERP'];
+const TIER = {
+  BTC: 1.0, ETH: 1.0,
+  SOL: 1.3, XRP: 1.3, ADA: 1.3, LTC: 1.3, DOGE: 1.3, AVAX: 1.3, LINK: 1.3, BNB: 1.3,
+  SUI: 1.7, HYPE: 1.7, DOT: 1.7, XLM: 1.7, SHIB: 1.7, HBAR: 1.7, BCH: 1.7,
+};
+
+function buildAssets(params) {
+  const assets = [];
+  for (const token of TOKENS) {
+    for (const pair of PAIRS) {
+      const tier = TIER[token];
+      const pairAdj = pair === 'FRONT_BACK' ? 0.8 : 1.0;
+      const mu = params.baseApyLevel * tier * pairAdj * params.regimeMultiplier;
+      const sigma = mu * (params.dailyVolPct / 100);
+      assets.push({ token, pair, mu, sigma, y: 0 });
+    }
+  }
+  return assets;
+}
+function stepAssets(assets, theta, rho, dt, rng) {
+  const sharedZ = rng();
+  for (const a of assets) {
+    const idioZ = rng();
+    const z = Math.sqrt(1 - rho) * idioZ + Math.sqrt(rho) * sharedZ;
+    a.y += -theta * a.y * dt + a.sigma * Math.sqrt(dt) * z;
+  }
+}
+function currentSpread(a) { return a.mu + a.y; }
+function makeRng(seed) {
+  let s = seed >>> 0;
+  function uniform() {
+    s = (Math.imul(1103515245, s) + 12345) >>> 0;
+    return s / 4294967296;
+  }
+  let spare = null;
+  return function normal() {
+    if (spare != null) { const v = spare; spare = null; return v; }
+    let u, v, sq;
+    do { u = uniform() * 2 - 1; v = uniform() * 2 - 1; sq = u * u + v * v; } while (sq >= 1 || sq === 0);
+    const mul = Math.sqrt(-2 * Math.log(sq) / sq);
+    spare = v * mul;
+    return u * mul;
+  };
+}
+function erf(x) {
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1) * t * Math.exp(-x*x);
+  return sign * y;
+}
+function rng_uniform01(rng) {
+  const z = rng();
+  return 0.5 * (1 + erf(z / Math.SQRT2));
+}
+function transitionCost() { return { makerLegs: 1, takerLegs: 1 }; }
+function feeForTransition(params, contracts) {
+  const { makerLegs, takerLegs } = transitionCost();
+  return makerLegs * params.makerFee * contracts + takerLegs * params.takerFee * contracts;
+}
+function simulateOnePath(params, rng) {
+  const assets = buildAssets(params);
+  const theta = Math.LN2 / params.halfLifeDays;
+  const dtDays = 1 / 24;
+  const stepsPerMonth = Math.round(30 / dtDays);
+  const exposure = params.notional * params.leverage;
+  const contractsPerLeg = exposure / params.contractNotional;
+
+  let cashPnL = 0, makerContracts = 0, rolls = 0, position = null;
+  let firstEntryHeldPnL = null, firstEntryAsset = null;
+
+  for (let step = 0; step < stepsPerMonth; step++) {
+    stepAssets(assets, theta, params.rho, dtDays, rng);
+
+    let best = null;
+    for (const a of assets) {
+      const mag = Math.abs(currentSpread(a));
+      if (!best || mag > best.mag) best = { asset: a, mag };
+    }
+    let currentMag = null, currentAsset = null;
+    if (position) {
+      currentAsset = assets.find(a => a.token === position.token && a.pair === position.pair);
+      currentMag = Math.abs(currentSpread(currentAsset));
+    }
+
+    if (firstEntryAsset == null && best.mag >= params.entryThreshold) {
+      firstEntryAsset = best.asset;
+      firstEntryHeldPnL = 0;
+    }
+    if (firstEntryAsset != null) {
+      const mag = Math.abs(currentSpread(firstEntryAsset));
+      firstEntryHeldPnL += (mag / 100) * exposure * (dtDays / 365);
+    }
+
+    if (!position) {
+      if (best.mag >= params.entryThreshold && rng_uniform01(rng) < params.fillProb) {
+        position = { token: best.asset.token, pair: best.asset.pair };
+        const cost = feeForTransition(params, contractsPerLeg);
+        cashPnL -= cost;
+        makerContracts += contractsPerLeg;
+      }
+    } else {
+      let bestAlt = null;
+      for (const a of assets) {
+        if (a === currentAsset) continue;
+        const mag = Math.abs(currentSpread(a));
+        if (!bestAlt || mag > bestAlt.mag) bestAlt = { asset: a, mag };
+      }
+      const extraCarry = bestAlt ? ((bestAlt.mag - currentMag) / 100) * exposure * (params.assumedHoldDays / 365) : -Infinity;
+      const rollCost = 2 * feeForTransition(params, contractsPerLeg);
+      const netBenefit = extraCarry - rollCost;
+
+      if (bestAlt && netBenefit > 0 && rng_uniform01(rng) < params.fillProb) {
+        cashPnL -= rollCost;
+        makerContracts += 2 * contractsPerLeg;
+        rolls++;
+        position = { token: bestAlt.asset.token, pair: bestAlt.asset.pair };
+      } else if (currentMag < params.exitThreshold && best.mag < params.entryThreshold) {
+        const cost = feeForTransition(params, contractsPerLeg);
+        cashPnL -= cost;
+        makerContracts += contractsPerLeg;
+        position = null;
+      }
+    }
+
+    if (position) {
+      const posAsset = assets.find(a => a.token === position.token && a.pair === position.pair);
+      const mag = Math.abs(currentSpread(posAsset));
+      cashPnL += (mag / 100) * exposure * (dtDays / 365);
+    }
+  }
+
+  const poolShare = Math.min(1, makerContracts / params.marketMakerContracts);
+  const poolPayout = params.poolSize * poolShare;
+
+  return {
+    rollingPnL: cashPnL,
+    rollingPlusPoolPnL: cashPnL + poolPayout,
+    staticHoldPnL: firstEntryHeldPnL || 0,
+    rolls, makerContracts, poolShare, poolPayout,
+    exposure, margin: params.notional,
+  };
+}
+function runMonteCarlo(params, numPaths, seed) {
+  const rng = makeRng(seed);
+  const results = [];
+  for (let i = 0; i < numPaths; i++) results.push(simulateOnePath(params, rng));
+  return results;
+}
+function annualizedApyOnMargin(pnl, margin) {
+  return (pnl / margin) * (365 / 30) * 100;
+}
+
+// ---------- UI wiring ----------
+const ids = ['notional','leverage','contractNotional','makerFee','takerFee','poolSize','marketMakerContracts',
+  'entryThreshold','exitThreshold','assumedHoldDays','fillProb',
+  'baseApyLevel','regimeMultiplier','halfLifeDays','dailyVolPct','rho',
+  'numPaths','seed','btcControlApy'];
+const els = {};
+ids.forEach(id => els[id] = document.getElementById(id));
+
+function syncLabels() {
+  ['leverage','entryThreshold','exitThreshold','assumedHoldDays','fillProb','baseApyLevel','regimeMultiplier','halfLifeDays','dailyVolPct','rho'].forEach(id => {
+    const out = document.getElementById(id + '-out');
+    if (out) out.textContent = els[id].value;
+  });
+}
+ids.forEach(id => els[id].addEventListener('input', syncLabels));
+syncLabels();
+
+function readParams() {
+  return {
+    notional: parseFloat(els.notional.value),
+    leverage: parseFloat(els.leverage.value),
+    contractNotional: parseFloat(els.contractNotional.value),
+    makerFee: parseFloat(els.makerFee.value),
+    takerFee: parseFloat(els.takerFee.value),
+    poolSize: parseFloat(els.poolSize.value),
+    marketMakerContracts: parseFloat(els.marketMakerContracts.value),
+    entryThreshold: parseFloat(els.entryThreshold.value),
+    exitThreshold: parseFloat(els.exitThreshold.value),
+    assumedHoldDays: parseFloat(els.assumedHoldDays.value),
+    fillProb: parseFloat(els.fillProb.value) / 100,
+    baseApyLevel: parseFloat(els.baseApyLevel.value),
+    regimeMultiplier: parseFloat(els.regimeMultiplier.value),
+    halfLifeDays: parseFloat(els.halfLifeDays.value),
+    dailyVolPct: parseFloat(els.dailyVolPct.value),
+    rho: parseFloat(els.rho.value),
+  };
+}
+
+function percentile(sorted, p) {
+  const idx = (p / 100) * (sorted.length - 1);
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
+let histChart = null;
+
+function runSimulation() {
+  const runBtn = document.getElementById('runBtn');
+  const status = document.getElementById('runStatus');
+  runBtn.disabled = true;
+  status.textContent = 'Running...';
+
+  setTimeout(() => {
+    const params = readParams();
+    const numPaths = parseInt(els.numPaths.value);
+    const seed = parseInt(els.seed.value);
+    const btcApy = parseFloat(els.btcControlApy.value);
+
+    const t0 = performance.now();
+    const results = runMonteCarlo(params, numPaths, seed);
+    const elapsed = performance.now() - t0;
+
+    const rollingApys = results.map(r => annualizedApyOnMargin(r.rollingPnL, r.margin)).sort((a,b)=>a-b);
+    const poolApys = results.map(r => annualizedApyOnMargin(r.rollingPlusPoolPnL, r.margin)).sort((a,b)=>a-b);
+    const staticApys = results.map(r => annualizedApyOnMargin(r.staticHoldPnL, r.margin)).sort((a,b)=>a-b);
+    const avgRolls = results.reduce((s,r)=>s+r.rolls,0) / numPaths;
+    const avgPoolShare = results.reduce((s,r)=>s+r.poolShare,0) / numPaths;
+    const winRate = poolApys.filter(a => a > btcApy).length / numPaths * 100;
+
+    const mean = arr => arr.reduce((s,x)=>s+x,0) / arr.length;
+
+    document.getElementById('resultsArea').style.display = 'block';
+    document.getElementById('summaryCards').innerHTML = `
+      <div class="card"><div class="lab">Mean APY, rolling + pool</div><div class="big ${mean(poolApys)>=0?'pos':'neg'}">${mean(poolApys).toFixed(1)}%</div><div class="sub">vs BTC control: ${btcApy}%</div></div>
+      <div class="card"><div class="lab">Win rate vs BTC control</div><div class="big ${winRate>=50?'pos':'neg'}">${winRate.toFixed(0)}%</div><div class="sub">of ${numPaths} simulated months</div></div>
+      <div class="card"><div class="lab">Avg rolls / month</div><div class="big">${avgRolls.toFixed(1)}</div><div class="sub">avg pool share captured: ${(avgPoolShare*100).toFixed(2)}%</div></div>
+      <div class="card"><div class="lab">Run time</div><div class="big">${(elapsed/1000).toFixed(1)}s</div><div class="sub">${numPaths} simulated months</div></div>
+    `;
+
+    document.getElementById('resultsTable').innerHTML = `
+      <tr><th>Strategy</th><th>Mean</th><th>Median</th><th>P10</th><th>P90</th><th>Min</th><th>Max</th></tr>
+      <tr><td>Rolling only (fees, no pool)</td>
+        <td>${mean(rollingApys).toFixed(1)}%</td><td>${percentile(rollingApys,50).toFixed(1)}%</td>
+        <td>${percentile(rollingApys,10).toFixed(1)}%</td><td>${percentile(rollingApys,90).toFixed(1)}%</td>
+        <td>${rollingApys[0].toFixed(1)}%</td><td>${rollingApys[rollingApys.length-1].toFixed(1)}%</td></tr>
+      <tr><td>Rolling + maker pool</td>
+        <td>${mean(poolApys).toFixed(1)}%</td><td>${percentile(poolApys,50).toFixed(1)}%</td>
+        <td>${percentile(poolApys,10).toFixed(1)}%</td><td>${percentile(poolApys,90).toFixed(1)}%</td>
+        <td>${poolApys[0].toFixed(1)}%</td><td>${poolApys[poolApys.length-1].toFixed(1)}%</td></tr>
+      <tr><td>Enter once, never roll</td>
+        <td>${mean(staticApys).toFixed(1)}%</td><td>${percentile(staticApys,50).toFixed(1)}%</td>
+        <td>${percentile(staticApys,10).toFixed(1)}%</td><td>${percentile(staticApys,90).toFixed(1)}%</td>
+        <td>${staticApys[0].toFixed(1)}%</td><td>${staticApys[staticApys.length-1].toFixed(1)}%</td></tr>
+      <tr><td>BTC control (flat)</td>
+        <td>${btcApy.toFixed(1)}%</td><td>${btcApy.toFixed(1)}%</td>
+        <td>${btcApy.toFixed(1)}%</td><td>${btcApy.toFixed(1)}%</td>
+        <td>${btcApy.toFixed(1)}%</td><td>${btcApy.toFixed(1)}%</td></tr>
+    `;
+
+    // histogram of rolling+pool distribution
+    const binCount = 30;
+    const min = poolApys[0], max = poolApys[poolApys.length-1];
+    const binWidth = (max - min) / binCount || 1;
+    const bins = new Array(binCount).fill(0);
+    poolApys.forEach(v => {
+      let idx = Math.floor((v - min) / binWidth);
+      if (idx >= binCount) idx = binCount - 1;
+      if (idx < 0) idx = 0;
+      bins[idx]++;
+    });
+    const labels = bins.map((_, i) => (min + i * binWidth).toFixed(0) + '%');
+
+    if (histChart) histChart.destroy();
+    histChart = new Chart(document.getElementById('histChart'), {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{ label: 'Rolling + pool, annualized APY distribution', data: bins, backgroundColor: 'rgba(96,165,250,0.5)', borderColor: '#60a5fa', borderWidth: 1 }],
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: '#c9d1d9' } } },
+        scales: {
+          x: { ticks: { color: '#6b7280', maxTicksLimit: 12 }, grid: { color: '#1f2937' } },
+          y: { ticks: { color: '#6b7280' }, grid: { color: '#1f2937' }, title: { display: true, text: '# of simulated months', color: '#6b7280' } },
+        },
+      },
+    });
+
+    runBtn.disabled = false;
+    status.textContent = `Done — ${numPaths} months simulated in ${(elapsed/1000).toFixed(1)}s.`;
+  }, 10);
+}
+
+document.getElementById('runBtn').addEventListener('click', runSimulation);
+</script>
+</body>
+</html>
