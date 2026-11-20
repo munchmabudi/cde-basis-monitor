@@ -64,6 +64,24 @@ function pairSpread(apyA, nameA, apyB, nameB) {
   return { spread, action };
 }
 
+
+// The exchange may publish the funding rate it expects for the CURRENT period (as opposed to the last one
+// paid). The field name is not documented anywhere I could reach, so look for the likely names in the
+// product, its details and its perpetual_details, and remember which one matched. Run
+// `node probe_funding.js` to see exactly what the feed carries.
+const PRED_KEYS = ['predicted_funding_rate', 'next_funding_rate', 'estimated_funding_rate', 'expected_funding_rate',
+  'projected_funding_rate', 'indicative_funding_rate', 'funding_rate_estimate', 'funding_rate_predicted', 'current_funding_rate'];
+function predictedFunding(p, d) {
+  const pd = d.perpetual_details || {};
+  for (const [where, obj] of [['details', d], ['perpetual_details', pd], ['product', p]]) {
+    for (const k of PRED_KEYS) {
+      const v = num(obj && obj[k]);
+      if (v != null) return { fundingPred: v, fundingPredSrc: `${where}.${k}` };
+    }
+  }
+  return { fundingPred: null, fundingPredSrc: null };
+}
+
 function buildSnapshot(futureProducts, spotProducts, opts = {}) {
   const fallbackDays = opts.fallbackHorizonDays ?? FALLBACK_HORIZON_DAYS;
   const horizonOverrideMs = (opts.horizonDays != null) ? opts.horizonDays * DAY_MS : null;
@@ -90,7 +108,9 @@ function buildSnapshot(futureProducts, spotProducts, opts = {}) {
       Tms: num(d.time_to_expiry_ms), fundingInterval: d.funding_interval || null,
       fundingSec: parseInterval(d.funding_interval), fundingRate: num(d.funding_rate),
       fundingTime: d.funding_time || null, index: num(d.index_price),
+      ...predictedFunding(p, d),
       contractSize: num(d.contract_size), oi: num(d.open_interest),
+      tickSize: num(p.quote_increment) || num(p.price_increment) || num(d.quote_increment) || num(d.tick_size) || null,
       vol24: num(p.approximate_quote_24h_volume),
     };
     (byRoot[root] = byRoot[root] || []).push(rec);
@@ -212,12 +232,14 @@ function buildSnapshot(futureProducts, spotProducts, opts = {}) {
     rows.push({
       root, hasDated: !!front, hasPerp: !!perp, hasBack: !!back,
       dated: front ? { productId: front.productId, code: front.code, F: front.mid, S: S_dated, Tms: front.Tms,
-        expiry: front.expiry, hoursToExpiry: frontHoursToExpiry, basisAPY, allInPct: allInDated, contractSize: front.contractSize, oi: front.oi, vol24: front.vol24 } : null,
+        expiry: front.expiry, hoursToExpiry: frontHoursToExpiry, basisAPY, allInPct: allInDated, contractSize: front.contractSize, tick: front.tickSize, oi: front.oi, vol24: front.vol24 } : null,
       back: back ? { productId: back.productId, code: back.code, F: back.mid, S: S_dated, Tms: back.Tms,
-        expiry: back.expiry, basisAPY: backBasisAPY, contractSize: back.contractSize, oi: back.oi, vol24: back.vol24 } : null,
+        expiry: back.expiry, basisAPY: backBasisAPY, contractSize: back.contractSize, tick: back.tickSize, oi: back.oi, vol24: back.vol24 } : null,
       perp: perp ? { productId: perp.productId, code: perp.code, P: perp.mid, S: S_perp, gapPct,
-        fundingRate: perp.fundingRate, fundingInterval: perp.fundingInterval, fundingTime: perp.fundingTime, fundAPY,
-        allInPct: allInPerp, contractSize: perp.contractSize, oi: perp.oi, vol24: perp.vol24 } : null,
+        fundingRate: perp.fundingRate, fundingSec: perp.fundingSec, fundingInterval: perp.fundingInterval, fundingTime: perp.fundingTime, fundAPY,
+        fundingPred: perp.fundingPred, fundingPredSrc: perp.fundingPredSrc, fundPredAPY: perp.fundingPred != null ? perpFundingAPY(perp.fundingPred, perp.fundingSec) : null,
+        premBp: (perp.index > 0 && perp.mid > 0) ? (perp.mid - perp.index) / perp.index * 1e4 : null,
+        allInPct: allInPerp, contractSize: perp.contractSize, tick: perp.tickSize, oi: perp.oi, vol24: perp.vol24 } : null,
       hDays: +(hMs / DAY_MS).toFixed(2), divergence, termSlope, backPerpSpread, bestSpread, verdict, flags,
     });
   }
@@ -233,6 +255,18 @@ function buildSnapshot(futureProducts, spotProducts, opts = {}) {
   const outHorizonDays = horizonOverrideMs != null ? +(horizonOverrideMs / DAY_MS).toFixed(2)
     : +(frontTmsChosen ? frontTmsChosen / DAY_MS : fallbackDays).toFixed(2);
   return { generatedAt: new Date().toISOString(), horizonDays: outHorizonDays, horizonOverride: horizonOverrideMs != null, rows };
+}
+
+const rp = (v) => (typeof v === 'number' && isFinite(v)) ? +v.toPrecision(9) : undefined;
+function spreadPx(r) {
+  const o = {};
+  const fm = r.dated ? rp(r.dated.F) : undefined, pm = r.perp ? rp(r.perp.P) : undefined;
+  const ix = r.perp ? rp(r.perp.S) : undefined;
+  if (fm !== undefined && pm !== undefined) { o.fm = fm; o.pm = pm; }
+  if (ix !== undefined) o.ix = ix;
+  const q = r.px;   // { fb, fa, pb, pa } set by the monitor
+  if (q) for (const k of ['fb', 'fa', 'pb', 'pa']) { const v = rp(q[k]); if (v !== undefined) o[k] = v; }
+  return o;
 }
 
 function logPoll(snap, ts = new Date().toISOString()) {
@@ -266,6 +300,10 @@ function logPoll(snap, ts = new Date().toISOString()) {
         term: frontTainted ? null : r.termSlope,
         bpApy: suspect ? null : r.backPerpSpread,
         frontExpiry: r.dated ? r.dated.expiry : null, fl: r.flags,
+        // Price-terms spread inputs (see cde_spread_history.js). fm/pm/ix come from
+        // the same snapshot fetch; fb/fa/pb/pa are book quotes attached by the
+        // monitor only when both legs were fresh and close in time, else absent.
+        ...(suspect ? {} : spreadPx(r)),
       };
     }
     fs.appendFileSync(LOG_PATH, JSON.stringify({ t: ts, tokens }) + '\n');

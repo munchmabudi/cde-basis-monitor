@@ -24,21 +24,19 @@
 //   CLI: node monitor_cde_basis.js [--once] [--port 8080] [--poll 30000] [--dryrun]
 //        [--horizon-days N] [--stats-window-days N]
 //
-// Env overrides: CDE_BASIS_PORT, CDE_BASIS_POLL_MS, CDE_BASIS_ONCE, CDE_BASIS_DRYRUN,
-//                CDE_BASIS_LOG, CDE_BASIS_HORIZON_DAYS, CDE_BASIS_STATS_WINDOW_DAYS.
+// Env overrides (all optional; can also live in a local .env file, never committed):
+//   CDE_BASIS_PORT, CDE_BASIS_POLL_MS, CDE_BASIS_ONCE, CDE_BASIS_DRYRUN, CDE_BASIS_LOG,
+//   CDE_BASIS_HORIZON_DAYS, CDE_BASIS_STATS_WINDOW_DAYS, CDE_BASIS_STALE_POLLS,
+//   CDE_BASIS_MAX_LOG_DAYS      (active-log retention before rotating older polls to data/archive/, default 60)
+//   CDE_BASIS_BOOK_TTL_MS / CDE_BASIS_BOOK_INTERVAL_MS   (Bid/Ask tab order-book cache and request pacing)
+//   CDE_ALERT_MAJORS / CDE_ALERT_MAJOR_APY / CDE_ALERT_ALT_APY / CDE_ALERT_CLEAR_APY   (alert defaults; editable live at /alerts/settings)
+//   CDE_BASIS_TELEGRAM_BOT_TOKEN / CDE_BASIS_TELEGRAM_CHAT_ID   (optional Telegram alerts; console-only if unset)
 //
-// KNOWN v1 PERF NOTE: stats are recomputed by re-reading the *entire* JSONL log
-// file on every poll. Fine for weeks/months of 30s-interval history (a few MB),
-// but will get slower as the log grows unbounded over a long deployment.
-// MITIGATION (done): loadLog now caches parsed entries by file mtime, so
-// within a poll cycle the 794MB file is read+parsed only once instead of
-// ~109 times. The single read/parse is ~12s; statsFromLog on cached entries
-// is ~87ms. For 100K+ polls the 1-call-per-cycle pattern keeps total poll
-// cycle well under the 30s interval.
-// LONG-TERM TODO: an in-memory rolling buffer updated incrementally, OR
-// periodic log rotation/rollup (mirror analysis/cde_viability_logger.js's
-// rollup() pattern) once the file exceeds ~1GB. Run with
-// node --max-old-space-size=8192 for headroom.
+// Tabs: Overview, Front vs Perp, Front vs Back, Term Structure, Bid/Ask (executable),
+//   My Positions (APY), Volume, Calibration, plus /chart?root=X, /alerts/settings.
+// Log growth: the stats/calibration code parses the whole active log, so the log is
+//   rotated automatically (analysis/cde_log_rotation.js) at startup and daily; nothing is deleted,
+//   older polls are moved to data/archive/.
 
 const http = require('http');
 const fs = require('fs');
@@ -72,7 +70,15 @@ const path = require('path');
   console.log('[cde-basis] loaded .env from', envPath);
 })();
 const { buildSnapshot, logPoll, LOG_PATH, SANITY_CAP_PCT } = require('./analysis/cde_basis');
+const calibration = require('./analysis/cde_basis_calibration');
+const { rotateLogIfNeeded } = require('./analysis/cde_log_rotation');
+const { createTrendTracker } = require('./analysis/cde_funding_trend');
+const fundTrend = createTrendTracker();
+const FUND_ALERT_APY = parseFloat(process.env.CDE_FUND_ALERT_APY || '') || 2;   // highlight a funding move of at least this many APY points
+const bidask = require('./analysis/cde_basis_bidask');
+const myPos = require('./analysis/cde_basis_positions');
 const { statsFromLog, historyFor, METRICS } = require('./analysis/cde_basis_stats');
+const { spreadHistoryFor } = require('./analysis/cde_spread_history');
 
 // ---------- "my positions" tracking (pin a token, see if it's converging or
 // diverging vs. where it was when you pinned it) ----------
@@ -170,6 +176,11 @@ const STATS_WINDOW_DAYS = (() => {
   const v = process.env.CDE_BASIS_STATS_WINDOW_DAYS || argv('--stats-window-days', '30');
   const n = parseFloat(v);
   return (!isNaN(n) && n > 0) ? n : 30;
+})();
+const MAX_ACTIVE_LOG_DAYS = (() => {
+  const v = process.env.CDE_BASIS_MAX_LOG_DAYS || argv('--max-log-days', '60');
+  const n = parseFloat(v);
+  return (!isNaN(n) && n > 0) ? n : 60;
 })();
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -298,18 +309,19 @@ const alertState = new Map(); // key -> { armed: boolean }
 
 function fmtApy(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 
-async function lookupZScore(root, metricKey, dayStats) {
+async function lookupZScore(root, metricKey) {
   try {
+    const dayStats = await statsFromLog(LOG_PATH, { windowDays: ALERT_ZSCORE_WINDOW_DAYS });
     const rec = dayStats.stats[root] && dayStats.stats[root][metricKey];
-    if (!rec) return 'insufficient history';
-    if (rec.z != null) return `${rec.z >= 0 ? '+' : ''}${rec.z.toFixed(2)}σ (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
-    return `not enough history yet (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
+    if (rec && rec.z != null) return `${rec.z >= 0 ? '+' : ''}${rec.z.toFixed(2)}σ (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
+    if (rec) return `not enough history yet (n=${rec.n} polls, past ${ALERT_ZSCORE_WINDOW_DAYS}d)`;
+    return 'insufficient history';
   } catch (e) {
     return `unavailable (${e.message})`;
   }
 }
 
-async function checkAlerts(snap, dayStats) {
+async function checkAlerts(snap) {
   for (const r of snap.rows) {
     // Never alert on data we've already decided not to trust for ranking —
     // an EXPIRING/STALE/SUSPECT reading is exactly the kind of thing that
@@ -332,7 +344,7 @@ async function checkAlerts(snap, dayStats) {
       if (!state.armed && mag >= entryThreshold) {
         state.armed = true;
         alertState.set(key, state);
-        const zTxt = await lookupZScore(r.root, def.metric, dayStats);
+        const zTxt = await lookupZScore(r.root, def.metric);
         const message =
           `🚨 <b>CDE Basis Alert — ${r.root}</b> (${isMajor ? 'major' : 'alt'}, entry ${entryThreshold}%)\n\n` +
           `<b>APY:</b> ${fmtApy(spread)} (${def.label})\n` +
@@ -344,7 +356,7 @@ async function checkAlerts(snap, dayStats) {
       } else if (state.armed && mag < exitThreshold) {
         state.armed = false;
         alertState.set(key, state);
-        const zTxt = await lookupZScore(r.root, def.metric, dayStats);
+        const zTxt = await lookupZScore(r.root, def.metric);
         const message =
           `✅ <b>CDE Basis Alert CLEARED — ${r.root}</b>\n\n` +
           `${def.label} has normalized: ${fmtApy(spread)}, below the ${exitThreshold}% exit threshold.\n` +
@@ -428,23 +440,21 @@ async function runCheck() {
   try {
     const [fut, spot] = await Promise.all([fetchJSON(FUT_URL), fetchJSON(SPOT_URL)]);
     const snap = buildSnapshot(fut.products, spot.products, { horizonDays: HORIZON_DAYS });
+    { const tNow = Date.now();   // funding direction: premium (perp vs index) now vs 15 minutes ago
+      for (const r of snap.rows) {
+        if (!r.perp) continue;
+        fundTrend.add(r.root, tNow, r.perp.premBp);
+        const t = fundTrend.trend(r.root, tNow);
+        r.perp.premDir = t.dir; r.perp.premRecentBp = t.recentBp; r.perp.premPriorBp = t.priorBp; r.perp.premDeltaBp = t.deltaBp;
+      } }
     snap.pollMs = Date.now() - t0;
     applyStaleFlags(snap.rows);
     latest = snap;
     lastError = null;
+    await attachSpreadQuotes(snap);   // never throws; adds bid/ask for the price-terms spread log
     logPoll(snap);
-    // Compute 1-day stats ONCE for z-score lookups (previously, checkAlerts
-    // called statsFromLog 36×3=108 times per poll — once per token/pair, each
-    // re-reading and re-parsing the entire JSONL log). Now the file is read
-    // once (via the loadLog mtime cache) and the result is reused.
-    let dayStats = null;
     try {
-      dayStats = await statsFromLog(LOG_PATH, { windowDays: ALERT_ZSCORE_WINDOW_DAYS });
-    } catch (e) {
-      console.warn(`[${new Date().toISOString()}] day-stats for alerts failed: ${e.message}`);
-    }
-    try {
-      await checkAlerts(snap, dayStats);
+      await checkAlerts(snap);
     } catch (e) {
       console.warn('[cde-basis] checkAlerts failed:', e.message);
     }
@@ -582,7 +592,11 @@ const NAV_ITEMS = [
   ['/front-perp', 'Front vs Perp'],
   ['/front-back', 'Front vs Back'],
   ['/term-structure', 'Term Structure (all 3)'],
+  ['/bidask', 'Bid/Ask (executable)'],
+  ['/quotes', 'Quote sheet (shadow)'],
+  ['/my-positions', 'My Positions (APY)'],
   ['/volume', 'Volume'],
+  ['/calibration', 'Calibration'],
 ];
 function navHTML(activePath) {
   const links = NAV_ITEMS.map(([href, label]) =>
@@ -594,6 +608,7 @@ const SHARED_STYLE = `
   h1{font-size:15px;margin:0 0 4px} h2{font-size:13px;margin:0 0 6px;color:#e5e7eb}
   a{color:#60a5fa}
   .meta{color:#6b7280;font-size:11px;margin-bottom:8px}
+  .fundbig{background:#78350f;color:#fde68a;border-radius:3px;padding:0 4px;font-weight:600} .dim{color:#6b7280}
   .err{color:#f87171;margin-bottom:6px}
   .pagenav{font-size:12px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #1f2937}
   .pagenav a{color:#9ca3af;text-decoration:none;margin-right:4px;padding:3px 8px;border-radius:4px}
@@ -707,6 +722,7 @@ function rowHTML(r, positions) {
     <td class="${r.termSlope == null ? '' : (r.termSlope > 0 ? 'pos' : 'neg')}" title="${r.hasBack ? 'front basis APY minus back basis APY' : 'no back-month contract for this token'}">${r.termSlope == null ? '—' : pct(r.termSlope)}</td>
     <td>${p ? (p.fundingRate * 1e6).toFixed(1) + 'µ' : '—'}</td>
     <td class="${p && p.fundAPY < 0 ? 'neg' : 'pos'}">${p ? pct(p.fundAPY) : '—'}</td>
+    <td>${fundCellHTML(p)}</td>
     <td class="${divCls}">${r.divergence == null ? '—' : pct(r.divergence, 2)}</td>
     <td class="${zClass(z)}" title="${zTitle}">${zTxt(z)}</td>
     <td class="${bsCls}" title="Best of the 3 pairwise spreads (front-perp, front-back, back-perp) for this token">${bsCell}</td>
@@ -727,6 +743,7 @@ function frontPerpRowHTML(r, positions) {
     <td>${num1(p.P)}</td><td>${num1(d.F)}</td>
     <td class="${d.basisAPY < 0 ? 'neg' : 'pos'}">${pct(d.basisAPY)}</td>
     <td class="${p.fundAPY < 0 ? 'neg' : 'pos'}">${pct(p.fundAPY)}</td>
+    <td>${fundCellHTML(p)}</td>
     <td class="${divCls}">${r.divergence == null ? '—' : pct(r.divergence, 2)}</td>
     <td class="${zClass(z)}" title="${zTitle}">${zTxt(z)}</td>
     <td class="${action.cls}">${action.text}</td>
@@ -743,7 +760,7 @@ function frontPerpPageHTML(snap, positions, hidden) {
   const excluded = snap.rows.length - rows.length;
   const body = rows.length
     ? rows.map(r => frontPerpRowHTML(r, positions)).join('\n')
-    : '<tr><td colspan="9" class="empty">No tokens currently have both a dated front-month AND a perp.</td></tr>';
+    : '<tr><td colspan="10" class="empty">No tokens currently have both a dated front-month AND a perp.</td></tr>';
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Front vs Perp — CDE Basis</title>
 <style>${SHARED_STYLE}</style></head><body>
@@ -752,7 +769,7 @@ ${hiddenBadgeHTML(hidden)}
 <h1>Front vs Perp</h1>
 <div class="meta">generated ${snap.generatedAt} · ${rows.length} tokens shown (${excluded} excluded — no dated future, or perp-only) · sorted by biggest |Rich/Cheap %| · Rich/Cheap % = front basis APY minus perp funding APY; positive = short future / long perp</div>
 <table>
-<thead><tr><th>Token</th><th>Perp</th><th>Front</th><th>Basis APY</th><th>Funding APY</th><th>Rich/Cheap %</th><th>Z-score</th><th>Action</th><th>Track</th></tr></thead>
+<thead><tr><th>Token</th><th>Perp</th><th>Front</th><th>Basis APY</th><th>Funding APY</th><th title="Predicted funding for the current period vs last paid, with direction; if the feed has none, the direction of the perp's premium to its index">Next funding</th><th>Rich/Cheap %</th><th>Z-score</th><th>Action</th><th>Track</th></tr></thead>
 <tbody>${body}</tbody>
 </table>
 <script>setTimeout(()=>location.reload(),5000);</script>
@@ -824,6 +841,7 @@ function termStructureRowHTML(r, positions) {
   return `<tr>
     <td class="root"><a href="/chart?root=${encodeURIComponent(r.root)}">${r.root}</a> ${flags}${hideButtonHTML(r.root)}</td>
     <td class="${p && p.fundAPY < 0 ? 'neg' : 'pos'}">${p ? pct(p.fundAPY) : '—'}</td>
+    <td>${fundCellHTML(p)}</td>
     <td class="${d && d.basisAPY < 0 ? 'neg' : 'pos'}">${d ? pct(d.basisAPY) : '—'}</td>
     <td class="${b && b.basisAPY < 0 ? 'neg' : 'pos'}">${b ? pct(b.basisAPY) : '—'}</td>
     <td class="shape ${shape.cls}">${shape.label}</td>
@@ -840,7 +858,7 @@ function termStructurePageHTML(snap, positions, hidden) {
     });
   const body = rows.length
     ? rows.map(r => termStructureRowHTML(r, positions)).join('\n')
-    : '<tr><td colspan="7" class="empty">No tokens currently have both a perp and a front-month dated future.</td></tr>';
+    : '<tr><td colspan="8" class="empty">No tokens currently have both a perp and a front-month dated future.</td></tr>';
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Term Structure — CDE Basis</title>
 <style>${SHARED_STYLE}</style></head><body>
@@ -849,10 +867,444 @@ ${hiddenBadgeHTML(hidden)}
 <h1>Term Structure — Perp → Front → Back</h1>
 <div class="meta">generated ${snap.generatedAt} · ${rows.length} tokens shown · sorted by |Best Spread| · Rising/Falling shapes mean the back↔perp spread is mathematically guaranteed to be the biggest of the 3 — Dip/Hump means front itself is the extreme, so check Best Spread's pair tag instead</div>
 <table>
-<thead><tr><th>Token</th><th>Perp Funding APY</th><th>Front Basis APY</th><th>Back Basis APY</th><th>Curve Shape</th><th>Best Spread</th><th>Track</th></tr></thead>
+<thead><tr><th>Token</th><th>Perp Funding APY</th><th title="Predicted funding for the current period vs last paid, with direction; if the feed has none, the direction of the perp's premium to its index over the last 15 minutes">Next funding</th><th>Front Basis APY</th><th>Back Basis APY</th><th>Curve Shape</th><th>Best Spread</th><th>Track</th></tr></thead>
 <tbody>${body}</tbody>
 </table>
 <script>setTimeout(()=>location.reload(),5000);</script>
+</body></html>`;
+}
+
+// ---------- My Positions: manually-entered positions ranked by the APY you're earning ----------
+// Uses the same mid-price APYs as the Overview / Front-vs-Perp tabs (perp = funding APY,
+// future = basis APY, spread = difference). Positions are saved to disk
+// (data/cde_basis_my_positions.json) and pinned to the specific contracts you
+// entered, so they survive restarts and contract expiries.
+const MY_POSITIONS_PATH = path.join(path.dirname(LOG_PATH), 'cde_basis_my_positions.json');
+
+function fmtUsdSigned(v) { return v == null ? '—' : `${v < 0 ? '−' : '+'}${fmtDollar(Math.abs(v))}`; }
+
+function myPositionsPageHTML(snap, errMsg) {
+  const esc = myPos.esc;
+  const positions = myPos.loadMyPositions(MY_POSITIONS_PATH);
+  const evals = myPos.rankEvaluated(myPos.evaluateAll(positions, snap.rows));
+  const sum = myPos.summarize(evals);
+  const options = {};
+  for (const r of snap.rows) { const a = myPos.availableInstruments(r); if (a.length) options[r.root] = a; }
+  const roots = Object.keys(options).sort();
+  const optsJson = JSON.stringify(options).replace(/</g, '\\u003c');
+
+  const rowHTML = (e) => {
+    const bad = e.status !== 'OK' || e.unreliable;
+    const statusTag = e.status === 'EXPIRED' ? ' <span class="neg">EXPIRED</span>'
+      : e.status !== 'OK' ? ` <span class="neg">no APY</span>`
+      : e.unreliable ? ' <span class="neg">(unreliable)</span>' : '';
+    const yourCls = e.yourApy == null ? '' : (e.yourApy >= 0 ? 'pos' : 'neg');
+    return `<tr data-bad="${bad ? 1 : 0}" data-token="${esc(e.root)}" data-mkt="${e.marketApy == null ? '' : e.marketApy}" data-your="${e.yourApy == null ? '' : e.yourApy}" data-notional="${e.notionalUsd == null ? '' : e.notionalUsd}" data-est="${e.estUsdYr == null ? '' : e.estUsdYr}"${bad ? ' style="opacity:.55"' : ''}>
+    <td class="root"><a href="/chart?root=${encodeURIComponent(e.root)}">${esc(e.root)}</a></td>
+    <td style="text-align:left" title="${esc(e.detail || e.reason || '')}">${esc(e.label)}${statusTag}${e.nowAs ? `<div class="meta" style="margin:0">now: ${esc(e.nowAs)}</div>` : ''}${e.reason ? `<div class="meta" style="margin:0">${esc(e.reason)}</div>` : ''}</td>
+    <td class="${e.side === 'LONG' ? 'perp' : 'fut'}">${e.side === 'LONG' ? 'Long' : 'Short'}</td>
+    <td>${e.notionalUsd == null ? '—' : fmtDollar(e.notionalUsd)}</td>
+    <td>${e.marketApy == null ? '—' : sgnPct(e.marketApy)}</td>
+    <td class="${yourCls}"><b>${e.yourApy == null ? '—' : sgnPct(e.yourApy)}</b></td>
+    <td class="${e.estUsdYr == null ? '' : (e.estUsdYr >= 0 ? 'pos' : 'neg')}">${fmtUsdSigned(e.estUsdYr)}</td>
+    <td style="text-align:left;color:#9ca3af">${esc(e.note)}</td>
+    <td style="text-align:left;white-space:nowrap">
+      <button type="button" class="editbtn" data-id="${esc(e.id)}" data-label="${esc(e.label)}" data-side="${esc(e.side)}" data-notional="${e.notionalUsd == null ? '' : e.notionalUsd}" data-note="${esc(e.note)}">edit</button>
+      <form method="POST" action="/my-positions/delete" class="hideform" onsubmit="return confirm('Delete this position?')"><input type="hidden" name="id" value="${esc(e.id)}"><button class="hidebtn" title="Delete position">✕</button></form>
+    </td>
+  </tr>`;
+  };
+  const body = evals.length ? evals.map(rowHTML).join('\n')
+    : '<tr><td colspan="9" class="empty">No positions yet — add one above.</td></tr>';
+  const sumLine = evals.length
+    ? `${sum.count} position${sum.count === 1 ? '' : 's'}` +
+      (sum.weightedCount ? ` · notional-weighted Your APY <b class="${sum.weightedYourApy >= 0 ? 'pos' : 'neg'}">${sgnPct(sum.weightedYourApy)}</b> across ${sum.weightedCount} with a notional (${fmtDollar(sum.totalNotional)}) · est. <b class="${sum.totalEstUsdYr >= 0 ? 'pos' : 'neg'}">${fmtUsdSigned(sum.totalEstUsdYr)}</b>/yr` : ' · add notionals to see a weighted average and $/yr') +
+      (sum.unscored ? ` · ${sum.unscored} not scored (expired, no data, or unreliable — excluded from the average)` : '')
+    : '';
+  const rootOpts = roots.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join('');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>My Positions — CDE Basis</title>
+<style>${SHARED_STYLE}
+  form#pform{background:#111827;border:1px solid #1f2937;border-radius:8px;padding:10px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  form#pform select, form#pform input[type=text]{background:#0b0e11;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:4px 6px;font:inherit}
+  form#pform button, button.editbtn{background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:4px 10px;font:inherit;cursor:pointer}
+  form#pform button.primary{background:#60a5fa;color:#0b0e11;border-color:#60a5fa;font-weight:600}
+  button.editbtn{padding:1px 6px;font-size:11px;color:#9ca3af}
+  button.editbtn:hover{color:#60a5fa}
+  th.srt{cursor:pointer;text-decoration:underline dotted #6b7280;user-select:none}
+  th.srt:hover{color:#60a5fa} th.srt.on{color:#0b0e11;background:#60a5fa}
+</style></head><body>
+${navHTML('/my-positions')}
+<h1>My Positions — ranked by the APY you're earning</h1>
+${errMsg ? `<div class="err">${esc(errMsg)}</div>` : ''}
+<form method="POST" action="/my-positions/save" id="pform">
+  <input type="hidden" name="id" id="f_id" value="">
+  <span id="pickers" style="display:contents">
+    <select name="root" id="f_root" required><option value="" disabled selected>— token —</option>${rootOpts}</select>
+    <select name="instrument" id="f_inst" required style="min-width:300px"><option value="" disabled selected>— instrument —</option></select>
+  </span>
+  <b id="editing" hidden></b>
+  <select name="side" id="f_side" required><option value="" disabled selected>— side —</option><option value="LONG">Long</option><option value="SHORT">Short</option></select>
+  <input type="text" name="notional" id="f_notional" placeholder="notional $ per leg (optional, e.g. 250k)" size="30" autocomplete="off">
+  <input type="text" name="note" id="f_note" placeholder="note (optional)" size="26" maxlength="120" autocomplete="off">
+  <button class="primary" id="f_submit">Add position</button>
+  <button type="button" id="f_cancel" hidden>Cancel edit</button>
+</form>
+<div class="meta">${sumLine}</div>
+<div class="sortnav"><b>Sorted by: <span id="sortlabel">…</span></b> <span style="color:#6b7280">(click an underlined header to change; best = highest Your APY)</span></div>
+<table id="t">
+<thead><tr><th class="srt" data-sort="token" style="text-align:left">Token</th><th style="text-align:left">Position</th><th>Side</th><th class="srt" data-sort="notional">Notional</th><th class="srt" data-sort="mkt">Market APY (mid)</th><th class="srt" data-sort="your">Your APY</th><th class="srt" data-sort="est">Est. $/yr</th><th style="text-align:left">Note</th><th></th></tr></thead>
+<tbody>${body}</tbody>
+</table>
+<div class="meta"><b>Market APY (mid)</b> is the same mid-price number the Overview and Front-vs-Perp tabs show: for a Perp it's the funding APY, for a future (1 = front, 2 = back) it's the basis APY vs the index, and for a spread it's first leg − second leg (1–Perp = front basis − perp funding, 2–Perp = back basis − perp funding, 1–2 = front basis − back basis; positive = the first leg is rich). <b>Your APY</b> is what you're actually earning: you <b>receive</b> when you're <b>short and the APY is positive</b>, or <b>long and it's negative</b>, so Your APY = Market APY if short, −Market APY if long. Positive/green = you're being paid; negative/red = you're paying. A <b>Long spread</b> is long the first leg and short the second. <b>Notional</b> is per leg; Est. $/yr = notional × Your APY. Rates move: funding changes each interval, and the basis APY will drift as expiry approaches. Positions are pinned to the exact contracts you picked — when a month expires the position shows EXPIRED rather than switching to the next month, and a position on Nov simply becomes the "1" once Oct is gone. Rows with under 24h to expiry, no data or an expired contract are dimmed and sorted last.</div>
+<script>
+(function(){
+  var OPTS = ${optsJson};
+  function sget(k){ try { return localStorage.getItem(k); } catch(e) { return null; } }
+  function sset(k,v){ try { localStorage.setItem(k,v); } catch(e) {} }
+  var $ = function(id){ return document.getElementById(id); };
+  var root=$('f_root'), inst=$('f_inst'), form=$('pform'), dirty=false;
+  function fillInst(){
+    inst.innerHTML = '<option value="" disabled selected>— instrument —</option>';
+    (OPTS[root.value] || []).forEach(function(o){ var e=document.createElement('option'); e.value=o.key; e.textContent=o.name; inst.appendChild(e); });
+  }
+  root.addEventListener('change', fillInst);
+  form.addEventListener('input', function(){ dirty = true; });
+  document.querySelectorAll('button.editbtn').forEach(function(b){
+    b.addEventListener('click', function(){
+      $('f_id').value = b.dataset.id;
+      $('pickers').style.display = 'none'; root.required = false; inst.required = false;
+      $('editing').hidden = false; $('editing').textContent = 'Editing: ' + b.dataset.label;
+      $('f_side').value = b.dataset.side; $('f_notional').value = b.dataset.notional; $('f_note').value = b.dataset.note;
+      $('f_submit').textContent = 'Save changes'; $('f_cancel').hidden = false; dirty = true;
+      form.scrollIntoView({behavior:'smooth', block:'center'});
+    });
+  });
+  $('f_cancel').addEventListener('click', function(){ location.href = '/my-positions'; });
+
+  var NAMES = { your: 'Your APY', mkt: 'Market APY', notional: 'Notional', est: 'Est. $/yr', token: 'Token' };
+  var sortKey = sget('cde_mypos_sort') || 'your', sortDir = sget('cde_mypos_dir') || 'desc';
+  var tbody = document.querySelector('#t tbody');
+  function applySort(){
+    var trs = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-token]'));
+    trs.sort(function(a, c){
+      if (a.dataset.bad !== c.dataset.bad) return a.dataset.bad === '1' ? 1 : -1;
+      if (sortKey === 'token') { var r = a.dataset.token.localeCompare(c.dataset.token); return sortDir === 'desc' ? -r : r; }
+      var av = parseFloat(a.dataset[sortKey]), cv = parseFloat(c.dataset[sortKey]), an = isNaN(av), cn = isNaN(cv);
+      if (an || cn) return (an && cn) ? 0 : (an ? 1 : -1);
+      return sortDir === 'desc' ? cv - av : av - cv;
+    });
+    trs.forEach(function(tr){ tbody.appendChild(tr); });
+    document.querySelectorAll('th.srt').forEach(function(th){
+      var on = th.dataset.sort === sortKey;
+      th.className = 'srt' + (on ? ' on' : '');
+      th.textContent = th.textContent.replace(/ [▲▼]$/, '') + (on ? (sortDir === 'desc' ? ' ▼' : ' ▲') : '');
+    });
+    $('sortlabel').textContent = NAMES[sortKey] + (sortKey === 'token' ? (sortDir === 'desc' ? ' — Z to A' : ' — A to Z') : (sortDir === 'desc' ? ' — highest first' : ' — lowest first'));
+  }
+  document.querySelectorAll('th.srt').forEach(function(th){
+    th.addEventListener('click', function(){
+      if (sortKey === th.dataset.sort) sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      else { sortKey = th.dataset.sort; sortDir = th.dataset.sort === 'token' ? 'asc' : 'desc'; }
+      sset('cde_mypos_sort', sortKey); sset('cde_mypos_dir', sortDir); applySort();
+    });
+  });
+  applySort();
+  setInterval(function(){
+    var a = document.activeElement;
+    if (dirty || (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName))) return;   // never reload under someone who's typing
+    location.reload();
+  }, 10000);
+})();
+</script>
+</body></html>`;
+}
+
+// ---------- Bid/Ask: spread APYs at EXECUTABLE prices ----------
+// Every other page prices legs at mid. This one pulls the live order book for
+// each leg (the bulk products list has empty bid/ask fields) and shows what the
+// spread annualizes to if you actually cross it: sell at the bid, buy at the
+// ask. Books are fetched on demand when this page loads and cached ~8s, so
+// nothing extra is polled while nobody is looking at it.
+// Spreads move far less than outright prices, so books are refreshed
+// leisurely: each is cached 30s and requests are paced 200ms apart (5/s), which
+// keeps a full ~75-book sweep (~15s) comfortably under Coinbase's rate limit.
+const BIDASK_PAGE_BUILD = 'columns-v8';
+const BOOK_INTERVAL_MS = parseInt(process.env.CDE_BASIS_BOOK_INTERVAL_MS || '') || 200;
+const BOOK_TTL_MS = parseInt(process.env.CDE_BASIS_BOOK_TTL_MS || '') || 30000;
+const BOOK_PAGE_REFRESH_S = Math.max(5, Math.round(BOOK_TTL_MS / 1000));
+// The page must never make a click feel dead: answer within ~0.7s with whatever
+// books are ready (the rest fill in on the next quick refresh), instead of
+// waiting for a whole sweep.
+const BOOK_PAGE_MAX_WAIT_MS = 700;
+const BOOK_LOADING_REFRESH_MS = 2000;
+// Keep books warm in the background for a while after the tab was last viewed,
+// so coming back to it is instant instead of a cold sweep. Stops by itself
+// (no requests at all) once nobody has looked for BOOK_WARM_WINDOW_MS.
+const BOOK_WARM_WINDOW_MS = 15 * 60 * 1000;
+let lastBookInterest = 0;
+function warmBooks() {
+  if (!latest || Date.now() - lastBookInterest > BOOK_WARM_WINDOW_MS) return;
+  bookFetcher.getBooks(bidask.productIdsNeeded(latest.rows, loadHidden()))
+    .catch(e => console.warn('[cde-basis] book warm-up failed:', e.message));
+}
+// Price-terms spread logging: for each token with a front dated future and a perp,
+// fetch both books through the shared paced fetcher (same rate limit protection as
+// the bid/ask page) and attach r.px = { fb, fa, pb, pa } for logPoll. The two books
+// are requested back to back so they are about 200 ms apart; a token is skipped
+// (logged with mids only) if either book failed, is a stale fallback, is too old,
+// or the two were fetched more than SPREAD_PAIR_MAX_GAP_MS apart.
+const SPREAD_LOG_BOOKS = !/^(0|false|off)$/i.test(process.env.CDE_SPREAD_LOG_BOOKS || '1');
+const SPREAD_BOOK_WAIT_MS = parseInt(process.env.CDE_SPREAD_BOOK_WAIT_MS || '') || 12000;
+const SPREAD_BOOK_MAX_AGE_MS = 15000;
+const SPREAD_PAIR_MAX_GAP_MS = 3000;
+async function attachSpreadQuotes(snap) {
+  if (!SPREAD_LOG_BOOKS) return;
+  try {
+    const ids = [];
+    for (const r of snap.rows) {
+      if (!r.dated || !r.perp || r.flags.includes('SUSPECT')) continue;
+      ids.push(r.dated.productId, r.perp.productId);
+    }
+    if (!ids.length) return;
+    const books = await bookFetcher.getBooks(ids, { maxWaitMs: SPREAD_BOOK_WAIT_MS, maxAgeMs: SPREAD_BOOK_MAX_AGE_MS });
+    const now = Date.now();
+    for (const r of snap.rows) {
+      if (!r.dated || !r.perp) continue;
+      const f = books.get(r.dated.productId), p = books.get(r.perp.productId);
+      const ok = (b) => b && !b.error && !b.stale && b.fetchedAt != null && now - b.fetchedAt <= SPREAD_BOOK_MAX_AGE_MS + 5000
+        && isFinite(b.bid) && isFinite(b.ask) && b.bid > 0 && b.ask >= b.bid;
+      if (!ok(f) || !ok(p) || Math.abs(f.fetchedAt - p.fetchedAt) > SPREAD_PAIR_MAX_GAP_MS) continue;
+      r.px = { fb: f.bid, fa: f.ask, pb: p.bid, pa: p.ask };
+    }
+  } catch (e) {
+    console.warn('[cde-basis] spread book fetch failed:', e.message);
+  }
+}
+const bookFetcher = bidask.createBookFetcher((u) => fetchJSON(u), { minIntervalMs: BOOK_INTERVAL_MS, ttlMs: BOOK_TTL_MS, maxStaleMs: BOOK_TTL_MS * 4 });
+
+function sgnPct(v, d = 2) { return v == null ? '—' : `${v >= 0 ? '+' : ''}${(+v).toFixed(d)}%`; }
+// Next-funding cell: the exchange's own predicted rate when the feed carries one, otherwise the
+// direction of the perp's premium to its index (what funding follows), with the numbers in the tooltip.
+const ARROW = { UP: '▲', DOWN: '▼', FLAT: '▬' };
+function fundDeltaApy(p) { return (p && p.fundPredAPY != null && p.fundAPY != null) ? p.fundPredAPY - p.fundAPY : null; }
+function fundCellHTML(p) {
+  if (!p) return '—';
+  const d = fundDeltaApy(p);
+  if (d != null) {
+    const dir = d > 0.05 ? 'UP' : d < -0.05 ? 'DOWN' : 'FLAT', big = Math.abs(d) >= FUND_ALERT_APY;
+    return `<span class="${big ? 'fundbig' : ''}" title="Predicted funding for the current period (${p.fundingPredSrc}): ${sgnPct(p.fundPredAPY)} APY vs ${sgnPct(p.fundAPY)} last paid, a move of ${d >= 0 ? '+' : ''}${d.toFixed(2)} APY points.">${sgnPct(p.fundPredAPY)} ${ARROW[dir]} <span class="dim">${d >= 0 ? '+' : ''}${d.toFixed(1)}</span></span>`;
+  }
+  if (p.premDir) {
+    const big = Math.abs(p.premDeltaBp) >= 1;
+    return `<span class="${big && p.premDir !== 'FLAT' ? 'fundbig' : ''}" title="No predicted funding rate in the exchange feed, so this shows where funding is heading: the perp's premium to its index averaged ${p.premRecentBp.toFixed(1)} bp over the last 15 min vs ${p.premPriorBp.toFixed(1)} bp the 15 min before (${p.premDeltaBp >= 0 ? '+' : ''}${p.premDeltaBp.toFixed(1)} bp). A higher premium means funding trending higher.">${ARROW[p.premDir]} <span class="dim">${p.premDeltaBp >= 0 ? '+' : ''}${p.premDeltaBp.toFixed(1)}bp</span></span>`;
+  }
+  return `<span class="dim" title="${p.premRecentBp != null ? 'Collecting premium history (needs about 15 minutes)' : 'No predicted funding or premium data'}">—</span>`;
+}
+
+// Spread prices are small and in the underlying's own units (AVAX: 0.03), so
+// show up to 5 significant digits and trim trailing zeros rather than using a
+// fixed decimal count.
+function fmtSpreadPx(v) { return v == null ? '—' : String(+(+v).toPrecision(5)); }
+const SPREAD_LABEL = { FRONT_PERP: '1–Perp', BACK_PERP: '2–Perp', FRONT_BACK: '1–2' };
+
+async function bidAskPageHTML(snap, hidden, pairFilter) {
+  const ids = bidask.productIdsNeeded(snap.rows, hidden);
+  // Don't make the page wait for a whole paced sweep: serve what's ready (plus
+  // last-good quotes) after a few seconds; the rest keeps loading in the
+  // background and the page re-checks quickly until everything is in.
+  lastBookInterest = Date.now();
+  const books = await bookFetcher.getBooks(ids, { maxWaitMs: BOOK_PAGE_MAX_WAIT_MS });
+  const loadingLegs = ids.filter(id => books.get(id) && books.get(id).error === 'loading').length;
+  // Failures that are worth retrying soon (timeouts, 429s, 5xx, network) vs.
+  // ones that are just the market's state (404 not listed, empty/one-sided book).
+  const transientFails = ids.filter(id => { const b = books.get(id); return b && b.error && b.error !== 'loading' && !/^HTTP 404|one-sided|empty book|crossed/.test(b.error); }).length;
+  const recheckMs = loadingLegs ? BOOK_LOADING_REFRESH_MS : (transientFails ? 5000 : BOOK_PAGE_REFRESH_S * 1000);
+  const built = bidask.buildBidAskRows(snap.rows, books, hidden);
+  const validFilters = ['ALL', 'FRONT_PERP', 'BACK_PERP', 'FRONT_BACK'];
+  const filt = validFilters.includes(pairFilter) ? pairFilter : 'ALL';
+  const rows = built.rows.filter(r => filt === 'ALL' || r.pair === filt);
+  const good = rows.filter(r => !r.error);
+  const bad = rows.filter(r => r.error && r.error !== 'loading');
+  // Default order mirrors what the in-browser script does after load: best
+  // immediate trade (funding included) first, unreliable rows last.
+  const bestOf = (r) => {
+    const f = r.pairFundAPY || 0;
+    return Math.max(r.bidLevel - f, -(r.askLevel - f));
+  };
+  good.sort((a, b) => (a.unreliable !== b.unreliable) ? (a.unreliable ? 1 : -1) : bestOf(b) - bestOf(a));
+  const filterLinks = validFilters.map(f => {
+    const label = f === 'ALL' ? 'All spreads' : { FRONT_PERP: '1–Perp (front vs perp)', BACK_PERP: '2–Perp (back vs perp)', FRONT_BACK: '1–2 (front vs back)' }[f];
+    return `<a href="/bidask?pair=${f}" class="${f === filt ? 'active' : ''}">${label}</a>`;
+  }).join(' ');
+  const rowHTML = (r) => {
+    const stale = r.maxBookAgeSec != null && r.maxBookAgeSec > 90;
+    const key = `${r.idA}|${r.idB}`;
+    const tag = `${r.root}${SPREAD_LABEL[r.pair]}`.replace('–', '-');
+    const spreadsTitle = `${r.nameA} minus ${r.nameB}; leg spreads ${r.spreadBpsA != null ? r.spreadBpsA.toFixed(1) : '?'} / ${r.spreadBpsB != null ? r.spreadBpsB.toFixed(1) : '?'} bps; book age ${r.maxBookAgeSec != null ? Math.max(0, r.maxBookAgeSec).toFixed(0) + 's' : '?'}`;
+    return `<tr data-fundpx="${r.fundPerCyclePx == null ? '' : r.fundPerCyclePx}" data-fundsec="${r.fundIntervalSec || ''}" data-token="${r.root}" data-tickknown="${r.tickFromTable ? 1 : 0}" data-tick0="${r.spreadTick == null ? '' : r.spreadTick}" data-ref="${r.refMid}" data-ann="${r.annFactor}" data-fund="${r.pairFundAPY == null ? 0 : r.pairFundAPY}" data-fundpred="${r.fundInfo && r.fundInfo.fundPredAPY != null ? r.fundInfo.fundPredAPY : ''}" data-unrel="${r.unreliable ? 1 : 0}" data-key="${key}"${r.unreliable ? ' style="opacity:.45"' : ''}>
+    <td class="root"><a href="/chart?root=${encodeURIComponent(r.root)}">${r.root}</a>${hideButtonHTML(r.root)}</td>
+    <td title="${spreadsTitle}">${r.root}${SPREAD_LABEL[r.pair].replace('–', '-')}${stale ? ' <span class="neg">⚠stale</span>' : ''}${r.unreliable ? ' <span class="neg">(&lt;24h)</span>' : ''}</td>
+    <td>${fmtSpreadPx(r.spreadBid)}</td><td data-px="${r.spreadBid}"></td>
+    <td>${fmtSpreadPx(r.spreadAsk)}</td><td data-px="${r.spreadAsk}"></td>
+    <td><input class="tickin" size="8" title="Minimum price move for this token's spreads. Pre-filled with a guess from the quote's decimals; type the real tick and it is remembered for every spread of this token."></td><td data-role="tickapy">—</td><td data-role="fundtick">—</td>
+    <td data-role="fund">${r.pairFundAPY == null ? '—' : sgnPct(r.pairFundAPY)}</td>
+    <td data-role="fundnext">${r.fundInfo ? fundCellHTML(r.fundInfo) : '—'}</td>
+    <td><input class="mypx" data-out="b_${tag}" data-kind="bid" size="7" placeholder="bid"></td><td id="b_${tag}">—</td>
+    <td><input class="mypx" data-out="o_${tag}" data-kind="offer" size="7" placeholder="offer"></td><td id="o_${tag}">—</td>
+  </tr>`;
+  };
+  const body = good.length
+    ? good.map(rowHTML).join('\n')
+    : `<tr><td colspan="15" class="empty">${loadingLegs ? 'Loading order books…' : 'No spreads with live quotes on both legs right now.'}</td></tr>`;
+  const errBlock = bad.length
+    ? `<div class="meta">No usable quote for ${bad.length} spread(s): ${bad.map(r => `${r.root} ${SPREAD_LABEL[r.pair]} (${r.error})`).join(' · ')}</div>`
+    : '';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Bid/Ask — CDE Basis</title>
+<style>${SHARED_STYLE}
+  input.mypx{background:#0b0e11;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 4px;font:inherit;text-align:right}
+  input.mypx:focus{outline:1px solid #60a5fa}
+  input.tickin{background:#0b0e11;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 4px;font:inherit;text-align:right;width:7em}
+  td.best{white-space:nowrap}
+  th.srt{cursor:pointer;text-decoration:underline dotted #6b7280;user-select:none}
+  th.srt:hover{color:#60a5fa}
+  th.srt.on{color:#0b0e11;background:#60a5fa}
+</style></head><body>
+${navHTML('/bidask')}
+${hiddenBadgeHTML(hidden)}
+<h1>Spreads priced in APY — at the bid, the ask, and your own prices</h1>
+<div class="meta">Live leg order books · ${good.length} spreads shown · ${built.stats.legsOk} legs quoted, ${built.stats.legsFailed} without a quote${loadingLegs ? ` (${loadingLegs} still loading — requests are paced to stay under Coinbase's rate limit; this page re-checks every 2s until they're in)` : ''} · quotes up to ${built.rows.reduce((mx, r) => Math.max(mx, r.maxBookAgeSec || 0), 0).toFixed(0)}s old (legs are fetched in sequence, grouped by token) · refreshes every ${recheckMs / 1000}s${transientFails ? ` (retrying ${transientFails} leg${transientFails === 1 ? '' : 's'} that failed to load)` : ''} (paused while you're typing)</div>
+<div class="sortnav">${filterLinks} &nbsp;·&nbsp; <label><input type="checkbox" id="fundcb" checked> include perp funding in the APYs</label> &nbsp;·&nbsp; <label title="Use the predicted funding rate for the current period instead of the last paid one wherever the feed provides it"><input type="checkbox" id="predcb"> use predicted funding</label> &nbsp;·&nbsp; <b>Sorted by: <span id="sortlabel">…</span></b> <span style="color:#6b7280">(click an underlined header to change)</span> &nbsp;·&nbsp; <span style="color:#4b5563">page build ${BIDASK_PAGE_BUILD}</span></div>
+<table id="t">
+<thead><tr><th class="srt" data-sort="token" style="text-align:left">Token</th><th>Spread</th><th>Spread bid</th><th class="srt" data-sort="bid">Bid APY</th><th>Spread ask</th><th class="srt" data-sort="ask">Ask APY</th><th title="Minimum spread price move (tick). Editable, saved per token.">Tick</th><th class="srt" data-sort="tick" title="How much the spread's APY changes for one minimum price move (one tick)">APY per tick</th><th class="srt" data-sort="fundtick" title="Ticks of spread value from ONE funding payment if you BUY the spread (long first leg, short the perp) and hold through it. Positive = you receive, negative = you pay. Selling the spread is the opposite sign. 1–2 spreads have no perp, so no funding.">Funding / cycle (ticks)</th><th>Perp funding (1y)</th><th title="Predicted funding for the current period vs last paid, with direction; if the feed carries no predicted rate, the direction of the perp's premium to its index over the last 15 minutes. Highlighted when the move is large.">Next funding</th><th>My bid</th><th class="srt" data-sort="mybid">My bid APY</th><th>My offer</th><th class="srt" data-sort="myoffer">My offer APY</th></tr></thead>
+<tbody>${body}</tbody>
+</table>
+${errBlock}
+<div class="meta"><b>Spread</b> = first leg minus second leg, in price units, the same way your synthetic spreads are quoted (AVA1-Perp = AVAX front − AVAX perp; 2 = next month; 1–2 = front − back). <b>Spread bid</b> = bid of the first leg − ask of the second: the price you could sell the spread at right now by hitting both legs. <b>Spread ask</b> = ask of the first leg − bid of the second: the price you could buy it at right now. These should match the market shown on your synthetic spread ladders.<br>
+<b>APY</b> = spread price ÷ perp (or front) price, annualized over the time until the legs converge (front expiry for 1–Perp, back expiry for 2–Perp, the gap between expiries for 1–2). Higher = richer front/back. With the funding box ticked, the perp's current funding rate is subtracted, so the number is a "rich vs. perp including funding" level comparable to the Rich/Cheap % on the other tabs. Type a spread price in <b>My bid</b> / <b>My offer</b> to see its APY (saved in this browser). <b>Click any underlined APY header to sort by it</b> (click again to flip high/low); rows where you haven't typed a price always sink to the bottom when sorting by your own prices. <b>Funding / cycle (ticks)</b> = one perp funding payment at the current rate (rate × perp price), expressed in spread ticks, for buying the spread (long the first leg, short the perp). Positive: you'd be paid that many ticks for holding through the next payment; negative: you'd pay. Sell the spread and it flips. It uses the rate as of now, which can change before the payment, and the Tick box, so correct ticks matter. <b>APY per tick</b> = how many APY points the spread moves for one minimum price move (<b>Tick</b> is pre-filled from CDE's published minimum tick per contract; for a token not in that list it is a guess from the quote's decimals. You can overwrite any tick; it is saved and applies to all of that token's spreads). This tab prices spreads leg-to-leg (future price vs perp price), so it will not exactly match the other tabs, which measure each leg against the index.</div>
+<script>
+(function(){
+  function sget(k){ try { return localStorage.getItem(k); } catch(e) { return null; } }
+  function sset(k,v){ try { localStorage.setItem(k,v); } catch(e) {} }
+  var cb = document.getElementById('fundcb');
+  var savedF = sget('cde_bidask_fund'); if (savedF !== null) cb.checked = savedF === '1';
+  function fmt(v){ return (v>=0?'+':'') + v.toFixed(2) + '%'; }
+  var pcb = document.getElementById('predcb');
+  var savedP = sget('cde_bidask_pred'); if (savedP !== null) pcb.checked = savedP === '1';
+  var FUND_THR = ${FUND_ALERT_APY};
+  function fundUsed(tr){
+    var f = (+tr.dataset.fund || 0);
+    if (pcb.checked && tr.dataset.fundpred !== '' && tr.dataset.fundpred != null) f = +tr.dataset.fundpred;
+    return f;
+  }
+  function lvl(tr, price){
+    var l = price / (+tr.dataset.ref) * (+tr.dataset.ann);
+    if (cb.checked) l -= fundUsed(tr);
+    return l;
+  }
+  // how much every APY in this row moves because predicted funding differs from the last paid rate
+  function dmark(tr){
+    if (tr.dataset.fundpred === '' || tr.dataset.fundpred == null || !cb.checked) return '';
+    var d = -((+tr.dataset.fundpred) - (+tr.dataset.fund || 0));
+    if (Math.abs(d) < 0.05) return '';
+    var big = Math.abs(d) >= FUND_THR;
+    return ' <span class="' + (big ? 'fundbig' : 'dim') + '" title="APY change from predicted funding vs the last paid rate (' + (d>=0?'+':'') + d.toFixed(2) + ' points)">' + (d > 0 ? '▲' : '▼') + Math.abs(d).toFixed(1) + '</span>';
+  }
+  var tbody = document.querySelector('#t tbody');
+  var sortKey = sget('cde_bidask_sort') || 'bid';
+  if (['bid','ask','tick','fundtick','token','mybid','myoffer'].indexOf(sortKey) < 0) sortKey = 'bid';
+  var sortDir = sget('cde_bidask_dir') || 'desc';
+  function recalc(doSort){
+    var trs = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-ref]'));
+    trs.forEach(function(tr){
+      var v = { bid: NaN, ask: NaN, mybid: NaN, myoffer: NaN, tick: NaN, fundtick: NaN, token: tr.dataset.token };
+      var names = ['bid', 'ask'];
+      tr.querySelectorAll('td[data-px]').forEach(function(td, i){
+        var p = parseFloat(td.dataset.px);
+        if (isNaN(p)) { td.textContent = '—'; return; }
+        v[names[i]] = lvl(tr, p);
+        td.innerHTML = fmt(v[names[i]]) + dmark(tr);
+      });
+      var ti = tr.querySelector('input.tickin');
+      if (ti && !ti._init) {
+        ti._init = true;
+        var sv = sget('cde_bidask_tick:' + tr.dataset.token);
+        ti.value = (sv !== null && sv !== '') ? sv : (tr.dataset.tick0 || '');
+        ti.addEventListener('input', function(){
+          sset('cde_bidask_tick:' + tr.dataset.token, ti.value);
+          tbody.querySelectorAll('tr[data-token="' + tr.dataset.token + '"] input.tickin').forEach(function(o){ if (o !== ti) o.value = ti.value; });
+          recalc(false);
+        });
+        ti.addEventListener('change', function(){ recalc(true); });
+      }
+      var tk = ti ? parseFloat(ti.value) : NaN, tcell = tr.querySelector('td[data-role="tickapy"]');
+      if (!isNaN(tk) && tk > 0) { v.tick = tk / (+tr.dataset.ref) * (+tr.dataset.ann); tcell.textContent = '±' + v.tick.toFixed(2) + '%'; }
+      else tcell.textContent = '—';
+      var fcell = tr.querySelector('td[data-role="fundtick"]'), fpx = parseFloat(tr.dataset.fundpx);
+      if (!isNaN(fpx) && !isNaN(tk) && tk > 0) {
+        v.fundtick = fpx / tk;
+        var fs = (+tr.dataset.fundsec) ? ' per ' + ((+tr.dataset.fundsec) % 3600 === 0 ? ((+tr.dataset.fundsec) / 3600) + 'h' : (+tr.dataset.fundsec) + 's') + ' payment' : '';
+        fcell.textContent = (v.fundtick >= 0 ? '+' : '') + (Math.abs(v.fundtick) >= 100 ? v.fundtick.toFixed(0) : v.fundtick.toFixed(2));
+        fcell.className = v.fundtick >= 0 ? 'pos' : 'neg';
+        fcell.title = 'Buying this spread receives ' + (fpx >= 0 ? '+' : '') + fpx.toPrecision(3) + ' in spread price' + fs + ' (= ' + v.fundtick.toFixed(2) + ' ticks). Selling pays the opposite.';
+      } else { fcell.textContent = '—'; fcell.className = ''; fcell.title = ''; }
+      tr.querySelectorAll('input.mypx').forEach(function(inp){
+        var out = document.getElementById(inp.dataset.out), p = parseFloat(inp.value);
+        if (inp.value.trim() === '' || isNaN(p)) { out.textContent = '—'; return; }
+        var l = lvl(tr, p);
+        v[inp.dataset.kind === 'bid' ? 'mybid' : 'myoffer'] = l;
+        out.innerHTML = fmt(l) + dmark(tr);
+      });
+      tr._v = v;
+    });
+    document.querySelectorAll('th.srt').forEach(function(th){
+      var on = th.dataset.sort === sortKey;
+      th.className = 'srt' + (on ? ' on' : '');
+      th.textContent = th.textContent.replace(/ [▲▼]$/, '') + (on ? (sortDir === 'desc' ? ' ▼' : ' ▲') : '');
+    });
+    var SORT_NAMES = { token: 'Token', bid: 'Bid APY', ask: 'Ask APY', tick: 'APY per tick', fundtick: 'Funding per cycle (ticks)', mybid: 'My bid APY', myoffer: 'My offer APY' };
+    var sl = document.getElementById('sortlabel');
+    if (sl) sl.textContent = (SORT_NAMES[sortKey] || sortKey) + (sortKey === 'token' ? (sortDir === 'desc' ? ' — Z to A' : ' — A to Z') : (sortDir === 'desc' ? ' — highest first' : ' — lowest first'));
+    if (doSort === false) return;   // don't reorder rows while the user is mid-typing
+    trs.sort(function(a, c){
+      if (a.dataset.unrel !== c.dataset.unrel) return a.dataset.unrel === '1' ? 1 : -1;
+      if (sortKey === 'token') { var r = a._v.token.localeCompare(c._v.token) || a.dataset.key.localeCompare(c.dataset.key); return sortDir === 'desc' ? -r : r; }
+      var av = a._v[sortKey], cv = c._v[sortKey], an = isNaN(av), cn = isNaN(cv);
+      if (an || cn) return (an && cn) ? 0 : (an ? 1 : -1);   // blanks always last
+      return sortDir === 'desc' ? cv - av : av - cv;
+    });
+    trs.forEach(function(tr){ tbody.appendChild(tr); });
+  }
+  document.querySelectorAll('th.srt').forEach(function(th){
+    th.title = 'Click to sort by this column; click again to flip';
+    th.addEventListener('click', function(){
+      if (sortKey === th.dataset.sort) sortDir = (sortDir === 'desc') ? 'asc' : 'desc';
+      else { sortKey = th.dataset.sort; sortDir = (sortKey === 'token') ? 'asc' : 'desc'; }
+      sset('cde_bidask_sort', sortKey); sset('cde_bidask_dir', sortDir);
+      recalc(true);
+    });
+  });
+  tbody.querySelectorAll('tr[data-key]').forEach(function(tr){
+    tr.querySelectorAll('input.mypx').forEach(function(inp){
+      var v = sget('cde_bidask:' + tr.dataset.key + ':' + inp.dataset.kind);
+      if (v !== null) inp.value = v;
+      inp.addEventListener('input', function(){
+        sset('cde_bidask:' + tr.dataset.key + ':' + inp.dataset.kind, inp.value);
+        recalc(false);
+      });
+      inp.addEventListener('change', function(){ recalc(true); });
+    });
+  });
+  cb.addEventListener('change', function(){ sset('cde_bidask_fund', cb.checked ? '1' : '0'); recalc(true); });
+  pcb.addEventListener('change', function(){ sset('cde_bidask_pred', pcb.checked ? '1' : '0'); recalc(true); });
+  recalc(true);
+  setInterval(function(){
+    var a = document.activeElement;
+    if (!(a && a.tagName === 'INPUT' && a.type === 'text')) location.reload();
+  }, ${recheckMs});
+})();
+</script>
 </body></html>`;
 }
 
@@ -926,6 +1378,134 @@ function volumeCSV() {
     r.backN,
   ].join(','));
   return [header, ...lines].join('\n') + '\n';
+}
+
+// ---------- Calibration: measures real market behavior from the logged
+// history, to replace guessed simulator parameters with real ones as
+// history accumulates. Not filtered by hidden tokens — hiding is a display
+// preference, not a signal that a token shouldn't count toward calibrating
+// overall market behavior. ----------
+function fmtDays(v) { return v == null ? '—' : v.toFixed(2) + 'd'; }
+function fmtPerDay(v) { return v == null ? '—' : v.toFixed(2) + '/day'; }
+
+async function calibrationPageHTML() {
+  const panel = await calibration.loadPanel(LOG_PATH);
+  const nav = navHTML('/calibration');
+
+  if (panel.length < 50) {
+    return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Calibration — CDE Basis</title>
+<style>${SHARED_STYLE}</style></head><body>
+${nav}
+<h1>Calibration</h1>
+<div class="empty">Only ${panel.length} polls logged so far — not enough history yet to compute meaningful statistics (need at least 50). Check back once the monitor has been running longer.</div>
+</body></html>`;
+  }
+
+  const spanDays = (panel[panel.length - 1].tMs - panel[0].tMs) / 86_400_000;
+  // Use the CURRENTLY CONFIGURED alert thresholds as the default lens, so
+  // this page stays consistent with whatever /alerts/settings has live —
+  // change the thresholds there and this page's numbers follow.
+  const entryThreshold = alertSettings.altThreshold;
+  const exitThreshold = alertSettings.clearThreshold;
+
+  const arrivals = calibration.arrivalStats(panel, entryThreshold);
+  const persistence = calibration.persistenceStats(panel);
+  const epStats = calibration.episodeStats(panel, entryThreshold, exitThreshold);
+  const corr = calibration.correlationStats(panel);
+  const replay = calibration.replayRolls(panel, {
+    entryThreshold, exitThreshold, assumedHoldDays: 1,
+    notional: 100000, leverage: 5, makerFee: 0.04, takerFee: 0.06, contractsPerLeg: 200,
+  });
+
+  const topArrivals = [...arrivals.perSeries].sort((a, b) => (b.perDay || 0) - (a.perDay || 0)).slice(0, 8);
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Calibration — CDE Basis</title>
+<style>${SHARED_STYLE}
+  .calgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:16px}
+  .calcard{background:#111827;border:1px solid #1f2937;border-radius:8px;padding:14px}
+  .calcard .lab{font-size:10px;text-transform:uppercase;color:#6b7280;margin-bottom:6px}
+  .calcard .big{font-size:20px;font-weight:700}
+  .calcard .sub{font-size:11px;color:#9ca3af;margin-top:4px}
+  .simbox{background:#111827;border:1px solid #60a5fa;border-radius:8px;padding:14px;margin-bottom:16px;font-size:12px;color:#9ca3af;line-height:1.7}
+  .simbox b{color:#60a5fa}
+</style></head><body>
+${nav}
+<h1>Calibration</h1>
+<div class="meta">Measures real market behavior directly from ${panel.length} logged polls spanning ${spanDays.toFixed(1)} days — no new data source, this is the same log the dashboard already writes to. Uses the currently configured alert thresholds (entry ${entryThreshold}%, exit ${exitThreshold}%) from <a href="/alerts/settings">Alert Settings</a> as the lens for these calculations.</div>
+${spanDays < 14 ? `<div class="err">Only ${spanDays.toFixed(1)} days of history — these numbers will move around a lot as more data accumulates. Treat everything below as provisional, not a settled calibration, until you have at least a few weeks.</div>` : ''}
+
+<h2>Arrival rate — how often does something cross the entry bar</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Any of the 51 spreads</div>
+    <div class="big">${fmtPerDay(arrivals.aggregate.perDay)}</div>
+    <div class="sub">${arrivals.aggregate.crossings} crossings over ${arrivals.aggregate.spanDays.toFixed(1)}d — this is "how often will we find A good trade"</div>
+  </div>
+</div>
+<table>
+<thead><tr><th>Token</th><th>Pair</th><th>Crossings</th><th>Per day</th></tr></thead>
+<tbody>${topArrivals.map(a => `<tr><td class="root">${a.root}</td><td>${a.pairKey}</td><td>${a.crossings}</td><td>${fmtPerDay(a.perDay)}</td></tr>`).join('\n')}</tbody>
+</table>
+
+<h2>Persistence — how fast a rich spread decays (empirical half-life)</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Median half-life</div>
+    <div class="big">${fmtDays(persistence.summary.medianHalfLifeDays)}</div>
+    <div class="sub">across ${persistence.summary.nEstimable} series with enough data (${persistence.summary.nLowConfidence} flagged low-confidence — near-random-walk, treat with caution)</div>
+  </div>
+  <div class="calcard">
+    <div class="lab">Mean half-life</div>
+    <div class="big">${fmtDays(persistence.summary.meanHalfLifeDays)}</div>
+  </div>
+</div>
+
+<h2>Episode duration — how long a qualifying opportunity actually lasts</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Median duration</div>
+    <div class="big">${fmtDays(epStats.summary.medianDurationDays)}</div>
+    <div class="sub">${epStats.summary.nClosedEpisodes} closed episodes, ${epStats.summary.nStillOpen} still open at end of log</div>
+  </div>
+  <div class="calcard">
+    <div class="lab">Mean duration</div>
+    <div class="big">${fmtDays(epStats.summary.meanDurationDays)}</div>
+  </div>
+</div>
+
+<h2>Roll frequency — replaying the real roll rule against real history</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Rolls / month (projected)</div>
+    <div class="big">${replay.rollsPerMonth != null ? replay.rollsPerMonth.toFixed(1) : '—'}</div>
+    <div class="sub">${replay.rolls} actual rolls, ${replay.entries} entries, ${replay.exits} exits over ${replay.spanDays.toFixed(1)}d</div>
+  </div>
+  <div class="calcard">
+    <div class="lab">Median hold between transitions</div>
+    <div class="big">${fmtDays(replay.medianHoldDaysBetweenTransitions)}</div>
+    <div class="sub">mean: ${fmtDays(replay.meanHoldDaysBetweenTransitions)}</div>
+  </div>
+</div>
+
+<h2>Correlation across spreads</h2>
+<div class="calgrid">
+  <div class="calcard">
+    <div class="lab">Mean pairwise correlation</div>
+    <div class="big">${corr.mean != null ? corr.mean.toFixed(2) : '—'}</div>
+    <div class="sub">median ${corr.median != null ? corr.median.toFixed(2) : '—'} · P10 ${corr.p10 != null ? corr.p10.toFixed(2) : '—'} · P90 ${corr.p90 != null ? corr.p90.toFixed(2) : '—'} · ${corr.nPairs} pairs with enough overlap</div>
+  </div>
+</div>
+
+<div class="simbox">
+  <b>What to plug into the simulator</b><br>
+  Mean-reversion half-life: <b>${fmtDays(persistence.summary.medianHalfLifeDays)}</b> (simulator's "Mean-reversion half-life" slider)<br>
+  Correlation: <b>${corr.mean != null ? corr.mean.toFixed(2) : '—'}</b> (simulator's "Correlation across spreads" slider)<br>
+  Assumed holding period: <b>${fmtDays(replay.medianHoldDaysBetweenTransitions)}</b> (simulator's "Expected holding period" slider — this replaces the earlier 1-day guess with a real measurement)<br>
+  <span style="color:#6b7280">These are measurements from ${spanDays.toFixed(1)} days of real history, not guarantees about the future — revisit this page periodically as more data accumulates, especially after living through a genuinely different volatility regime.</span>
+</div>
+</body></html>`;
 }
 
 // ---------- "My Positions" panel: pinned tokens with entry vs. current ----------
@@ -1081,7 +1661,7 @@ ${sortNav}
 <table>
 <thead><tr>
 <th>Token</th>
-<th>Perp</th><th>Front</th><th>Back</th><th>Basis APY</th><th>Term (F−B)</th><th>Funding (1h)</th><th>Funding APY</th>
+<th>Perp</th><th>Front</th><th>Back</th><th>Basis APY</th><th>Term (F−B)</th><th>Funding (1h)</th><th>Funding APY</th><th title="Predicted funding for the current period vs last paid, with direction; if the feed has none, the direction of the perp's premium to its index">Next funding</th>
 <th>Rich/Cheap %</th><th>Z-score</th><th>Best Spread</th><th>Action (Front↔Perp)</th><th>Track</th>
 </tr></thead>
 <tbody>
@@ -1143,6 +1723,14 @@ function chartPageHTML(root) {
 <div id="zboxes"></div>
 <div id="rollnote"></div>
 <canvas id="chart"></canvas>
+<div style="margin:22px 0 6px;border-top:1px solid #1f2937;padding-top:12px">
+  <b>Spread price</b> (front dated future &minus; perp) &middot; same token and range &middot; show:
+  <button class="togglebtn active" id="spModePx" type="button">Price</button><button class="togglebtn" id="spModePct" type="button">% of index</button>
+  &nbsp;<button class="togglebtn active" id="spBA" type="button" title="Show the bid-side spread (future bid &minus; perp bid) and ask-side spread (future ask &minus; perp ask) as well as the mid">Bid / ask</button>
+</div>
+<div id="spstats"></div>
+<div id="spnote" class="meta"></div>
+<canvas id="spchart"></canvas>
 <script>
 const ROOT = ${JSON.stringify(safeRoot)};
 const METRIC_LABEL = {div:'Divergence %',bApy:'Basis APY %',fApy:'Funding APY %',gap:'Perp gap %',aD:'Dated all-in %',aP:'Perp all-in %',bkApy:'Back-month basis APY %',term:'Term slope (F−B) %',bpApy:'Back↔Perp spread %',frontVol:'Front 24h Volume ($)',backVol:'Back 24h Volume ($)'};
@@ -1325,12 +1913,111 @@ async function load(metric, windowDays) {
   });
 }
 
+
+// ---------- spread price chart (below the APY chart) ----------
+let spChart = null, spData = null, spMode = 'px', spEff = 'px', spBA = true, spUser = false;
+const SP_ROLL_PLUGIN = {
+  id: 'spRolls',
+  afterDatasetsDraw(c) {
+    if (!spData || !spData.rolls || !spData.rolls.length) return;
+    const x = c.scales.x, a = c.chartArea, ctx = c.ctx;
+    ctx.save(); ctx.strokeStyle = '#a78bfa'; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+    spData.rolls.forEach(function (r) {
+      const px = x.getPixelForValue(r.t);
+      if (px >= a.left && px <= a.right) { ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke(); }
+    });
+    ctx.restore();
+  }
+};
+function spFmt(v) {
+  if (v == null) return '—';
+  if (spEff === 'pct') return v.toFixed(3) + '%';
+  if (spData && spData.tick) { const s = String(spData.tick), m = /e-(\d+)$/.exec(s); const dec = m ? +m[1] : (s.split('.')[1] || '').length; return v.toFixed(Math.min(dec + 1, 10)); }
+  return String(+v.toPrecision(5));
+}
+async function loadSpread(windowDays) {
+  let data;
+  try {
+    const res = await fetch('/api/spread?root=' + encodeURIComponent(ROOT) + '&windowDays=' + windowDays);
+    data = await res.json();
+  } catch (e) { data = { error: String(e) }; }
+  if (data.error) { document.getElementById('spnote').textContent = 'Spread chart: ' + data.error; return; }
+  spData = data;
+  drawSpread();
+}
+function drawSpread() {
+  const d = spData; if (!d) return;
+  const tickNote = d.tick ? (' Tick = ' + d.tick + '.') : '';
+  // not enough priced polls yet: fall back to % of index, which is backfilled from the APY log
+  const pxReady = d.nPrice >= 20;
+  // Until the user picks a view, show Price only once priced polls cover at least half the window
+  // (older history only exists as % of index); after a click, honor the choice if there is any price data.
+  const tFirst = d.t.length ? d.t[0] : 0, tLast = d.t.length ? d.t[d.t.length - 1] : 0;
+  const cover = (d.firstPriceT && tLast > tFirst) ? (tLast - d.firstPriceT) / (tLast - tFirst) : 0;
+  const mode = d.nPrice < 2 ? 'pct' : (spUser ? spMode : (cover >= 0.5 ? 'px' : 'pct'));
+  const prevMode = mode === 'px' ? 'px' : (spUser && spMode === 'px' ? 'px' : 'pct'); spEff = mode;
+  document.getElementById('spModePx').classList.toggle('active', mode === 'px');
+  document.getElementById('spModePct').classList.toggle('active', mode === 'pct');
+  const mid = mode === 'px' ? d.mid : d.midPct, bid = mode === 'px' ? d.bid : d.bidPct, ask = mode === 'px' ? d.ask : d.askPct;
+  const st = mode === 'px' ? d.stats.px.mid : d.stats.pct.mid;
+  let note = '';
+  if (!pxReady) note += 'Price history is still collecting (' + d.nPrice + ' priced polls so far, about 2 per minute)' + (mode === 'pct' ? ', so this shows % of index, backfilled from the APY history. ' : '. ');
+  if (mode === 'px' && d.firstPriceT) note += 'Price data starts ' + new Date(d.firstPriceT).toLocaleString() + '; the time axis matches the chart above, so earlier history is blank. ';
+  if (mode === 'pct' && d.firstPriceT) note += 'Price history (and bid/ask) starts ' + new Date(d.firstPriceT).toLocaleString() + '; before that only the mid is available. ';
+  if (mode === 'pct' && !d.firstPriceT && d.n) note += 'Mid only: the older log has no bid/ask prices. ';
+  note += 'Dashed purple lines mark contract rolls (the level jumps because the front contract changed). Stats cover the current front contract only.' + tickNote;
+  document.getElementById('spnote').textContent = note;
+  let zhtml = '';
+  if (st && st.n) {
+    const zc = zColor(d.bandsOk ? st.z : null);
+    zhtml += '<div class="zbox"><div class="lab">Mid now</div><div class="val">' + spFmt(st.latest) + '</div></div>';
+    zhtml += '<div class="zbox"><div class="lab">Mean (this contract)</div><div class="val">' + spFmt(st.mean) + '</div></div>';
+    zhtml += '<div class="zbox"><div class="lab">Range</div><div class="val" style="font-size:14px">' + spFmt(st.min) + ' to ' + spFmt(st.max) + '</div></div>';
+    if (d.bandsOk) zhtml += '<div class="zbox"><div class="lab">z-score</div><div class="val" style="color:' + zc + '">' + (st.z == null ? '—' : st.z.toFixed(2)) + '</div></div>';
+    else zhtml += '<div class="zbox"><div class="lab">z-score</div><div class="val" style="font-size:12px;color:#6b7280">levels only over 7+ days (spreads drift into expiry)</div></div>';
+  }
+  document.getElementById('spstats').innerHTML = zhtml;
+  const pts = (arr) => d.t.map(function (t, i) { return { x: t, y: arr[i] }; });
+  const fewPts = mid.filter(function (v) { return v != null; }).length < 60;   // too few points for a line: draw dots
+  const rad = fewPts ? 3 : 0;
+  const sets = [{ label: 'Spread mid', data: pts(mid), borderColor: '#60a5fa', backgroundColor: '#60a5fa', borderWidth: 1.5, pointRadius: rad, tension: 0.1, spanGaps: false, order: 1 }];
+  if (spBA && mode === 'px' || spBA && d.firstPriceT) {
+    sets.push({ label: 'Bid spread (fut bid − perp bid)', data: pts(bid), borderColor: '#34d399', backgroundColor: '#34d399', borderWidth: 1, pointRadius: rad, tension: 0, spanGaps: false, order: 2 });
+    sets.push({ label: 'Ask spread (fut ask − perp ask)', data: pts(ask), borderColor: '#f87171', backgroundColor: '#f87171', borderWidth: 1, pointRadius: rad, tension: 0, spanGaps: false, order: 3 });
+  }
+  if (spChart) spChart.destroy();
+  const t0 = d.t.length ? d.t[0] : d.since, t1 = d.t.length ? d.t[d.t.length - 1] : d.until;
+  spChart = new Chart(document.getElementById('spchart'), {
+    type: 'line', data: { datasets: sets },
+    options: {
+      responsive: true, animation: false, parsing: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#c9d1d9' } },
+        tooltip: { callbacks: {
+          title: function (items) { return items.length ? new Date(items[0].parsed.x).toLocaleString() : ''; },
+          label: function (c) { return c.dataset.label + ': ' + spFmt(c.parsed.y); }
+        } }
+      },
+      scales: {
+        x: { type: 'linear', min: t0, max: t1, ticks: { color: '#6b7280', maxTicksLimit: 8, callback: function (v) { return new Date(v).toLocaleString(); } }, grid: { color: '#1f2937' } },
+        y: { ticks: { color: '#6b7280', callback: function (v) { return spEff === 'pct' ? v.toFixed(2) + '%' : v; } }, grid: { color: '#1f2937' }, title: { display: true, text: mode === 'px' ? 'Spread price (underlying units)' : 'Spread, % of index', color: '#6b7280' } }
+      }
+    },
+    plugins: [SP_ROLL_PLUGIN]
+  });
+}
+document.getElementById('spModePx').addEventListener('click', function () { spUser = true; spMode = 'px'; drawSpread(); });
+document.getElementById('spModePct').addEventListener('click', function () { spUser = true; spMode = 'pct'; drawSpread(); });
+document.getElementById('spBA').addEventListener('click', function () { spBA = !spBA; document.getElementById('spBA').classList.toggle('active', spBA); drawSpread(); });
+
 let currentRangeDays = '30';
 let autoScaleEnabled = true;
 function selectRange(days) {
   currentRangeDays = String(days);
   document.querySelectorAll('.rangebtn').forEach(b => b.classList.toggle('active', b.dataset.days === currentRangeDays));
   load(document.getElementById('metric').value, currentRangeDays);
+  loadSpread(currentRangeDays);
 }
 document.querySelectorAll('.rangebtn').forEach(b => b.addEventListener('click', () => selectRange(b.dataset.days)));
 document.getElementById('metric').addEventListener('change', e => load(e.target.value, currentRangeDays));
@@ -1340,9 +2027,173 @@ document.getElementById('autoScaleBtn').addEventListener('click', () => {
   load(document.getElementById('metric').value, currentRangeDays);
 });
 selectRange('30');
-setInterval(() => load(document.getElementById('metric').value, currentRangeDays), 30000);
+setInterval(() => { load(document.getElementById('metric').value, currentRangeDays); loadSpread(currentRangeDays); }, 30000);
 </script>
 </body></html>`;
+}
+
+// ---------- Quote sheet + fill logger (shadow mode: sends no orders) ----------
+// Off by default because it adds ~5 requests per token every sweep. Turn on with
+// CDE_TAPE=1 (or --tape). CDE_TAPE_ROOTS=ETH,SOL limits it to some tokens.
+const TAPE_ON = hasFlag('--tape') || /^(1|true|yes|on)$/i.test(process.env.CDE_TAPE || '');
+const TAPE_ROOTS = (process.env.CDE_TAPE_ROOTS || '').split(',').map(s => s.trim()).filter(Boolean);
+const TAPE_SWEEP_MS = parseInt(process.env.CDE_TAPE_SWEEP_MS || '') || 15000;
+const FILLS_PATH = path.join(path.dirname(LOG_PATH), 'cde_sim_fills.jsonl');
+const quotes = require('./analysis/cde_quotes');
+const fills = require('./analysis/cde_fills');
+const envNum = (k, d) => { const v = parseFloat(process.env[k]); return isFinite(v) ? v : d; };
+const QUOTE_PARAMS = {
+  ...quotes.DEFAULTS,
+  feeExchange: envNum('CDE_Q_FEE_EXCHANGE', quotes.DEFAULTS.feeExchange), feeClearing: envNum('CDE_Q_FEE_CLEARING', quotes.DEFAULTS.feeClearing),
+  feeBasis: /^round/i.test(process.env.CDE_Q_FEE_BASIS || '') ? 'roundtrip' : 'fill',
+  pairs: /^all$/i.test(process.env.CDE_TAPE_PAIRS || '') ? ['FRONT_PERP', 'BACK_PERP', 'FRONT_BACK'] : (process.env.CDE_TAPE_PAIRS ? process.env.CDE_TAPE_PAIRS.split(',').map(x => x.trim().toUpperCase()).filter(Boolean) : quotes.DEFAULTS.pairs),
+  eMinTicks: envNum('CDE_Q_EMIN', quotes.DEFAULTS.eMinTicks), betaTicks: envNum('CDE_Q_BETA', quotes.DEFAULTS.betaTicks),
+  slipTicks: envNum('CDE_Q_SLIP', quotes.DEFAULTS.slipTicks), levels: envNum('CDE_Q_LEVELS', quotes.DEFAULTS.levels),
+  clipUsd: envNum('CDE_Q_CLIP_USD', quotes.DEFAULTS.clipUsd), limitUsd: envNum('CDE_Q_LIMIT_USD', quotes.DEFAULTS.limitUsd),
+  halfLifeMin: envNum('CDE_Q_HALFLIFE_MIN', quotes.DEFAULTS.halfLifeMin), warmupMin: envNum('CDE_Q_WARMUP_MIN', quotes.DEFAULTS.warmupMin),
+  kappa: envNum('CDE_Q_KAPPA', quotes.DEFAULTS.kappa), minHorizonDays: envNum('CDE_Q_MIN_DAYS', quotes.DEFAULTS.minHorizonDays),
+  monthlyVolume: envNum('CDE_Q_MONTHLY_VOLUME', null), incentiveUsd: envNum('CDE_Q_INCENTIVE_USD', quotes.DEFAULTS.incentiveUsd), incentivePct: envNum('CDE_Q_INCENTIVE_PCT', quotes.DEFAULTS.incentivePct),
+};
+const quoteTickOf = (root, qA, qB) => bidask.MIN_TICK[String(root).toUpperCase()] || bidask.guessSpreadTick(qA && qA.bid, qA && qA.ask, qB && qB.bid, qB && qB.ask);
+const fairValue = quotes.createFairValue({ halfLifeMin: QUOTE_PARAMS.halfLifeMin });
+const FAIR_PATH = path.join(path.dirname(LOG_PATH), 'cde_fair_value.json');
+const COVERAGE_PATH = path.join(path.dirname(LOG_PATH), 'cde_tape_coverage.log');
+try { if (TAPE_ON && fs.existsSync(FAIR_PATH)) fairValue.import(JSON.parse(fs.readFileSync(FAIR_PATH, 'utf8'))); } catch (e) { console.warn('[cde-basis] fair value reload failed:', e.message); }
+const tape = TAPE_ON ? fills.createTape({
+  fetchJSON: (u) => fetchJSON(u),
+  getScope: () => (latest ? latest.rows : []),
+  tickOf: quoteTickOf, pairs: QUOTE_PARAMS.pairs, logPath: FILLS_PATH, coveragePath: COVERAGE_PATH, sweepMs: TAPE_SWEEP_MS,
+  roots: TAPE_ROOTS, sideMode: process.env.CDE_TAPE_SIDE || 'auto',
+  log: (m) => console.warn('[cde-basis]', m),
+  onSweep: () => { if (latest) { quotes.updateFairValues(fairValue, latest.rows, tape.ring, Date.now(), Date.parse(latest.generatedAt), QUOTE_PARAMS.pairs); try { fs.writeFileSync(FAIR_PATH, JSON.stringify(fairValue.export())); } catch { /* best effort */ }
+      try { lastSheetMap = new Map(quoteSheet().filter(q => q.summary).map(q => [`${q.root}|${q.pair}`, q])); } catch (e) { console.warn('[cde-basis] quote sheet refresh failed:', e.message); } } },
+  onFill: (rec) => onSimFill(rec),
+}) : null;
+function quoteSheet() {
+  if (!tape || !latest) return [];
+  const hidden = loadHidden();
+  const rows = latest.rows.filter(r => !hidden[r.root] && r.perp && (!TAPE_ROOTS.length || TAPE_ROOTS.map(s => s.toUpperCase()).includes(String(r.root).toUpperCase())));
+  return quotes.buildQuoteSheet(rows, {
+    params: QUOTE_PARAMS, ring: tape.ring, fv: fairValue, tickOf: quoteTickOf, nowMs: Date.now(), snapAtMs: Date.parse(latest.generatedAt),
+    tapeCurve: (root, pair, side, clip, pid) => tape.curve(root, pair, side, { windowMs: 6 * 3600_000, clip, pid }),
+  });
+}
+// Shadow P&L: when a simulated tape fill lands at least as deep as our current top quote
+// (so a resting quote there would have been hit), credit that quote's edge on min(trade size, clip).
+const SHADOW_PATH = path.join(path.dirname(LOG_PATH), 'cde_shadow_pnl.jsonl');
+const shadow = new Map();           // root|pair|side -> { fills, contracts, pnlUsd, incUsd, sinceMs }
+let lastSheetMap = new Map();
+function shadowAdd(rec, persist) {
+  const k = `${rec.root}|${rec.pair}|${rec.side}`;
+  let s = shadow.get(k); if (!s) { s = { fills: 0, contracts: 0, pnlUsd: 0, incUsd: 0, sinceMs: rec.tMs }; shadow.set(k, s); }
+  s.fills++; s.contracts += rec.contracts; s.pnlUsd += rec.pnlUsd; s.incUsd += rec.incUsd || 0;
+  if (rec.tMs < s.sinceMs) s.sinceMs = rec.tMs;
+  if (persist) { try { fs.appendFileSync(SHADOW_PATH, JSON.stringify({ v: 2, t: new Date(rec.tMs).toISOString(), root: rec.root, pair: rec.pair, side: rec.side, contracts: rec.contracts, pnlUsd: +rec.pnlUsd.toFixed(6), incUsd: +(rec.incUsd || 0).toFixed(6) }) + '\n'); } catch { /* best effort */ } }
+}
+function shadowLoad() {
+  try {
+    if (!fs.existsSync(SHADOW_PATH)) return 0;
+    let n = 0; const cut = Date.now() - 24 * 3600_000;
+    for (const line of fs.readFileSync(SHADOW_PATH, 'utf8').split('\n')) {
+      if (!line) continue;
+      try { const r = JSON.parse(line); const tMs = Date.parse(r.t); if (r.v === 2 && tMs >= cut && QUOTE_PARAMS.pairs.includes(r.pair)) { shadowAdd({ ...r, tMs }, false); n++; } } catch { /* skip */ }
+    }
+    return n;
+  } catch { return 0; }
+}
+function onSimFill(rec) {
+  const q = lastSheetMap.get(`${rec.root}|${rec.pair}`);
+  if (!q || !q.summary || !q.warm) return;
+  const L = (rec.side === 'BUY' ? q.bid : q.ask).levels[0];
+  if (!L || rec.dist > L.dist + 1e-9) return;
+  const contracts = Math.min(rec.size, q.contracts);
+  shadowAdd({ root: rec.root, pair: rec.pair, side: rec.side, tMs: rec.tMs, contracts, pnlUsd: L.edge * q.dollarsPerTick * contracts,
+    incUsd: q.summary.incPerContract != null ? q.summary.incPerContract * contracts : 0 }, true);
+}
+function quotesPageHTML(hidden, pairFilter) {
+  const head = (inner) => `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Quote sheet — CDE Basis</title>
+<style>${SHARED_STYLE} td.l,th.l{text-align:left} .lv{white-space:nowrap} .dim{color:#6b7280} .good{color:#34d399} .bad{color:#f87171} .warm{color:#fbbf24}
+ table.k td{padding:3px 8px;vertical-align:top} th.srt{cursor:pointer;text-decoration:underline dotted #6b7280;user-select:none} th.srt:hover{color:#60a5fa} th.srt.on{color:#0b0e11;background:#60a5fa}</style></head><body>${navHTML('/quotes')}${hiddenBadgeHTML(hidden)}
+<h1>Quote sheet — where we would quote (shadow mode, no orders are sent)</h1>${inner}</body></html>`;
+  if (!tape) return head(`<div class="meta">The tape is off. Turn it on by starting the monitor with <b>CDE_TAPE=1</b> (cmd: <code>set "CDE_TAPE=1"</code> then <code>node monitor_cde_basis.js</code>, or add the line <code>CDE_TAPE=1</code> to your .env). It polls the order books and trade tape of every token every ${TAPE_SWEEP_MS / 1000}s, so keep it off if you only want the dashboard.</div>`);
+  const P = QUOTE_PARAMS, st = tape.status();
+  const all = quoteSheet();
+  const validFilters = ['ALL', ...P.pairs];
+  const filt = validFilters.includes(pairFilter) ? pairFilter : 'ALL';
+  const sheet = all.filter(q => filt === 'ALL' || q.pair === filt);
+  const px = fmtSpreadPx;
+  const usd = (v, d = 2) => v == null ? '—' : (v < 0 ? '−$' : '$') + Math.abs(v).toFixed(d);
+  const fx = (v, d = 1) => v == null ? '—' : (+v).toFixed(d);
+  const top = (L) => L.levels[0] ? `${px(L.levels[0].spreadPx)} → <b>${px(L.levels[0].futurePx)}</b><div class="dim">${L.levels[0].k}t · +${L.levels[0].edge.toFixed(1)}t · d${L.levels[0].dist}${L.levels[0].hedgeShort ? ` <span class="warm" title="the hedge leg's best price shows only ${L.levels[0].hedgeTouch} contracts, less than our clip: hedging would walk the book, so real slippage is worse than shown">⚠ hedge ${L.levels[0].hedgeTouch}c</span>` : ''}</div>` : '<span class="dim">no quote</span>';
+  const lvl = (L) => L.levels.length ? L.levels.map(l => `<div class="lv">${l.k} · ${px(l.spreadPx)} → <b>${px(l.futurePx)}</b> <span class="dim">(+${l.edge.toFixed(1)}t, d${l.dist})</span></div>`).join('') : '<span class="dim">no quote</span>';
+  const ladder = P.levels > 1;
+  const shadowFor = (q) => { const a = shadow.get(`${q.root}|${q.pair}|BUY`), b = shadow.get(`${q.root}|${q.pair}|SELL`); return { fills: (a ? a.fills : 0) + (b ? b.fills : 0), pnl: (a ? a.pnlUsd : 0) + (b ? b.pnlUsd : 0), inc: (a ? a.incUsd : 0) + (b ? b.incUsd : 0), contracts: (a ? a.contracts : 0) + (b ? b.contracts : 0) }; };
+  let totShadow = 0, totInc = 0, totFills = 0;
+  for (const v of shadow.values()) { totShadow += v.pnlUsd; totInc += v.incUsd; totFills += v.fills; }
+  const body = sheet.map(q => {
+    const tag = `${q.root}${SPREAD_LABEL[q.pair]}`;
+    if (q.error && q.mT == null) return `<tr data-err="1"><td class="l">${tag}</td><td colspan="14" class="dim">${q.error}</td></tr>`;
+    const S = q.summary, sh = shadowFor(q);
+    const warm = q.warm ? '' : ' <span class="warm" title="fair value has less than the warm-up history">warming</span>';
+    const dat = { token: q.root, width: q.synWidthTicks, edge: Math.max(S.bidEdgeUsd ?? -1e9, S.askEdgeUsd ?? -1e9), fills: (S.bidFillsHr || 0) + (S.askFillsHr || 0), contracts: S.contractsHr, edgehr: S.edgeUsdHr, inc: S.incUsdHr, total: S.totalUsdHr, shadow: sh.pnl, vol: S.vol24 };
+    const attrs = Object.entries(dat).map(([k, v]) => `data-${k}="${v == null || (typeof v === 'number' && !isFinite(v)) || v === -1e9 ? '' : v}"`).join(' ');
+    return `<tr ${attrs}>
+<td class="l">${tag}${warm}</td>
+<td>${px(q.synBid)} / ${px(q.synAsk)}</td>
+<td>${q.synWidthTicks}t<div class="dim">c ${q.cTicks.toFixed(2)}t</div></td>
+<td>${px(q.mPx)}<div class="dim">${q.fairApy.toFixed(1)}% APY</div></td>
+<td>${q.ceil} / ${q.floor}<div class="dim">${px(q.ceil * q.tick)} / ${px(q.floor * q.tick)}</div></td>
+<td class="l">${ladder ? lvl(q.bid) : top(q.bid)}</td><td class="l">${ladder ? lvl(q.ask) : top(q.ask)}</td>
+<td>${usd(S.bidEdgeUsd)} / ${usd(S.askEdgeUsd)}<div class="dim">${q.contracts}c × $${q.dollarsPerTick.toFixed(3)}/t</div></td>
+<td>${S.bidFillsHr != null || S.askFillsHr != null ? `${fx(S.bidFillsHr)} / ${fx(S.askFillsHr)}` : `<span class="dim">${q.bid.curveFills}+${q.ask.curveFills} sim</span>`}<div class="dim">${q.bid.pick}/${q.ask.pick}</div></td>
+<td>${fx(S.contractsHr)}</td>
+<td>${usd(S.edgeUsdHr)}</td>
+<td>${S.incPerContract == null ? '<span class="dim">off</span>' : usd(S.incUsdHr)}</td>
+<td><b>${usd(S.totalUsdHr)}</b></td>
+<td>${sh.fills ? `<span class="${sh.pnl >= 0 ? 'good' : 'bad'}">${usd(sh.pnl)}</span><div class="dim">${sh.fills} fills · ${sh.contracts.toFixed(0)}c</div>` : '<span class="dim">—</span>'}</td>
+<td>${S.vol24 == null ? '—' : '$' + (S.vol24 >= 1e6 ? (S.vol24 / 1e6).toFixed(1) + 'M' : Math.round(S.vol24 / 1e3) + 'k')}</td></tr>`;
+  }).join('');
+  const recent = tape.recentFills({ limit: 25 }).map(f => `<tr><td class="l">${f.t.slice(11, 19)}</td><td class="l">${f.root}${SPREAD_LABEL[f.pair]}</td><td>${f.leg}</td><td>${f.feedSide}</td><td>${f.taker}→maker ${f.maker}</td><td>${px(f.px)} ×${f.size}</td><td><b>we ${f.side === 'BUY' ? 'bought' : 'sold'}</b> ${px(f.spx)}</td><td>${px(f.synBid)} / ${px(f.synAsk)}</td><td>${f.dist}</td><td>${f.edgeMid}</td><td>${f.lag}s</td></tr>`).join('');
+  const filterLinks = validFilters.map(f => `<a href="/quotes?pair=${f}" class="${f === filt ? 'active' : ''}">${f === 'ALL' ? 'All spreads' : SPREAD_LABEL[f] + (f === 'FRONT_PERP' ? ' (front vs perp)' : f === 'BACK_PERP' ? ' (back vs perp)' : ' (front vs back)')}</a>`).join(' ');
+  const sideInfo = st.side;
+  return head(`
+<div class="meta">tape: ${st.sweeps} sweeps (last ${st.lastSweepMs != null ? (st.lastSweepMs / 1000).toFixed(1) + 's' : '—'}) · ${st.trades} tape trades seen · ${st.fills} simulated fills (${st.skippedLag} skipped: hedge quote too old, ${st.skippedNoQuote} skipped: no quote) · ${st.errors} request errors${st.lastError ? ` (last: ${st.lastError})` : ''} · trade-side feed treated as: <b>${sideInfo.active}</b> side${sideInfo.n ? ` (checked on ${sideInfo.n} trades, ${(100 * sideInfo.sameAsTaker).toFixed(0)}% matched taker-side)` : ' (not checked yet)'} · refreshes every 10s</div>
+<div class="meta">Shadow P&amp;L, last 24h, all spreads: <b class="${totShadow >= 0 ? 'good' : 'bad'}">${usd(totShadow)}</b> from ${totFills} simulated fills${P.monthlyVolume > 0 ? ` + ${usd(totInc)} volume incentive` : ''} · fills log ${FILLS_PATH}</div>
+<div class="meta">Settings (env vars, then restart): fees $${P.feeExchange} exchange + $${P.feeClearing} clearing per contract per trade = $${((P.feeExchange + P.feeClearing) * P.feeLegs).toFixed(2)} per hedged fill, $${((P.feeExchange + P.feeClearing) * P.feeLegs * 2).toFixed(2)} round trip (${P.feeBasis === 'roundtrip' ? 'charging the full round trip on every fill' : 'charging one hedged fill per fill'}; CDE_Q_FEE_EXCHANGE, CDE_Q_FEE_CLEARING, CDE_Q_FEE_BASIS) · spreads: ${P.pairs.map(x => SPREAD_LABEL[x]).join(', ')} (CDE_TAPE_PAIRS) · e_min ${P.eMinTicks}t (CDE_Q_EMIN) · β ${P.betaTicks}t (CDE_Q_BETA) · slippage ${P.slipTicks}t (CDE_Q_SLIP) · ${P.levels} level${P.levels === 1 ? '' : 's'} (CDE_Q_LEVELS) · clip ≈$${P.clipUsd} (CDE_Q_CLIP_USD) · fair value half-life ${P.halfLifeMin} min, warm-up ${P.warmupMin} min · funding weight κ ${P.kappa} (CDE_Q_KAPPA) · incentive: ${P.monthlyVolume > 0 ? `$${P.incentiveUsd} per ${P.incentivePct}% of ${P.monthlyVolume.toLocaleString()} contracts/month = $${(P.incentiveUsd / (P.incentivePct / 100 * P.monthlyVolume)).toFixed(4)} per contract` : 'off (set CDE_Q_MONTHLY_VOLUME to the total CDE contracts per month)'}</div>
+<div class="meta">Each tape trade is counted once and hedged on the perp. ${P.pairs.includes('FRONT_BACK') ? 'The 1–2 rows reuse those same trades hedged on the other future instead, so they are an alternative route, not extra P&amp;L: do not add them to the perp rows.' : 'The 1–2 route is off (it would reuse the same trades hedged on the other future; set CDE_TAPE_PAIRS=all to compare it).'}</div>
+<div class="sortnav">${filterLinks} &nbsp;·&nbsp; <b>Sorted by: <span id="sortlabel">…</span></b> <span class="dim">(click an underlined header to change)</span></div>
+<table class="k" id="qt"><thead><tr><th class="l srt" data-sort="token">Spread</th><th>Synthetic bid / offer</th><th class="srt" data-sort="width" title="Width of the market on legs in ticks, and the all-in cost per fill c">Width · cost</th><th>Fair value m</th><th title="highest bid / lowest offer that still earns e_min">Bid ceiling / offer floor</th><th class="l" title="spread price → future order price; tick · edge after costs · d = ticks from the synthetic touch">${ladder ? 'Bid ladder' : 'Best bid'}</th><th class="l">${ladder ? 'Offer ladder' : 'Best offer'}</th><th class="srt" data-sort="edge" title="profit per fill after all costs, for one clip at the top level (bid / offer)">Edge $/fill (bid / offer)</th><th class="srt" data-sort="fills" title="simulated fills per hour at the top level, from the trade tape">Fills/hr (bid / offer)</th><th class="srt" data-sort="contracts" title="contracts per hour we would fill (each fill capped at our clip), both sides">Contracts/hr</th><th class="srt" data-sort="edgehr" title="fills × edge: expected profit per hour from edge, both sides">Edge $/hr</th><th class="srt" data-sort="inc" title="contracts/hr × incentive value per contract">Incentive $/hr</th><th class="srt" data-sort="total" title="edge + incentive, per hour">Total $/hr</th><th class="srt" data-sort="shadow" title="what our current top quote would have earned on simulated tape fills, last 24h">Shadow P&amp;L (24h)</th><th class="srt" data-sort="vol" title="24h traded value of the quoted future (USD)">24h volume</th></tr></thead>
+<tbody>${body}</tbody></table>
+<div class="meta" style="margin-top:6px">How to read it: rank by <b>Total $/hr</b> for profit and volume together. <b>Edge $/fill</b> is the money per fill after fees, slippage and buffer. <b>Fills/hr</b> and <b>Contracts/hr</b> come from simulated fills (an upper bound: the tape shows nothing about queue position). <b>d</b> = ticks from the synthetic touch: 0 joins the market on legs, positive improves it, negative sits behind it and rarely fills. "limit" means the top level is the cost-limited ceiling/floor (not enough tape data yet); "fill-rate" means it was picked by expected $ per hour.</div>
+<h2 style="margin-top:14px">Latest simulated fills (audit these against the tape)</h2>
+<table class="k"><thead><tr><th class="l">Time (UTC)</th><th class="l">Spread</th><th>Tape leg</th><th>Feed side</th><th>Aggressor → maker</th><th>Tape price × size</th><th>Our hedged spread</th><th>Synthetic bid / offer</th><th title="ticks from the synthetic touch on our side">Dist (t)</th><th title="ticks better than the synthetic mid">Edge vs mid (t, before fees)</th><th title="age of the hedge-leg quote used">Hedge lag</th></tr></thead><tbody>${recent || '<tr><td colspan="11" class="dim">none yet</td></tr>'}</tbody></table>
+<script>
+(function(){
+  var tb=document.querySelector('#qt tbody'), ths=document.querySelectorAll('#qt th.srt'), key='total', dir=-1;
+  try{var s=JSON.parse(localStorage.getItem('cde_quotes_sort')||'null'); if(s&&s.key){key=s.key;dir=s.dir;}}catch(e){}
+  function val(tr,k){var v=tr.getAttribute('data-'+k); if(k==='token') return v||''; return v===''||v==null?null:parseFloat(v);}
+  function apply(){
+    var rows=[].slice.call(tb.querySelectorAll('tr'));
+    rows.sort(function(a,b){
+      var ea=a.getAttribute('data-err')?1:0, eb=b.getAttribute('data-err')?1:0; if(ea!==eb) return ea-eb;
+      var x=val(a,key), y=val(b,key);
+      if(key==='token') return dir*(x<y?-1:x>y?1:0);
+      if(x==null&&y==null) return 0; if(x==null) return 1; if(y==null) return -1;
+      return dir*(x-y);
+    }).forEach(function(r){tb.appendChild(r);});
+    ths.forEach(function(t){t.classList.toggle('on',t.getAttribute('data-sort')===key);});
+    var th=document.querySelector('#qt th[data-sort="'+key+'"]'); document.getElementById('sortlabel').textContent=(th?th.textContent:key)+(dir<0?' (high → low)':' (low → high)');
+  }
+  ths.forEach(function(t){t.addEventListener('click',function(){var k=t.getAttribute('data-sort'); if(k===key) dir=-dir; else {key=k; dir=(k==='token')?1:-1;} try{localStorage.setItem('cde_quotes_sort',JSON.stringify({key:key,dir:dir}));}catch(e){} apply();});});
+  apply(); setTimeout(function(){location.reload();},10000);
+})();
+</script>`);
+}
+function fillsCSV() {
+  const cols = ['t', 'root', 'pair', 'leg', 'feedSide', 'taker', 'maker', 'side', 'px', 'size', 'spx', 'synBid', 'synAsk', 'dist', 'edgeMid', 'lag', 'tick', 'tid', 'pid'];
+  const lines = [cols.join(',')];
+  for (const f of (tape ? tape.allFills() : [])) lines.push(cols.map(c => f[c] == null ? '' : f[c]).join(','));
+  return lines.join('\n');
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1409,6 +2260,25 @@ const server = http.createServer(async (req, res) => {
         }
       });
       res.end(JSON.stringify({ root, metric, points, stats: statsOut, rolls }));
+    } catch (e) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/spread') {
+    res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store');
+    const root = url.searchParams.get('root');
+    const windowDays = parseFloat(url.searchParams.get('windowDays') || '');
+    if (!root || !/^[A-Za-z0-9_]+$/.test(root)) { res.statusCode = 400; res.end(JSON.stringify({ error: 'missing or invalid ?root=' })); return; }
+    try {
+      const out = await spreadHistoryFor(LOG_PATH, root, {
+        windowDays: (!isNaN(windowDays) && windowDays > 0) ? windowDays : STATS_WINDOW_DAYS,
+        horizonOverride: HORIZON_DAYS != null,
+        tick: bidask.MIN_TICK[root.toUpperCase()] || null,
+      });
+      res.end(JSON.stringify(out));
     } catch (e) {
       res.statusCode = 500;
       res.end(JSON.stringify({ error: e.message }));
@@ -1493,9 +2363,102 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/my-positions') {
+    res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
+    if (!latest) { res.end('<p>loading… <a href="/">back to dashboard</a></p>'); return; }
+    res.end(myPositionsPageHTML(latest, (url.searchParams.get('err') || '').slice(0, 300)));
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/my-positions/save') {
+    const body = parseFormBody(await readBody(req));
+    const back = (err) => {
+      res.statusCode = 303;
+      res.setHeader('location', '/my-positions' + (err ? '?err=' + encodeURIComponent(err) : ''));
+      res.end();
+    };
+    if (!latest) return back('Market data is still loading — try again in a few seconds.');
+    const positions = myPos.loadMyPositions(MY_POSITIONS_PATH);
+    if (body.id) {
+      const idx = positions.findIndex(p => p.id === body.id);
+      if (idx < 0) return back('That position no longer exists.');
+      const r = myPos.buildPosition(body, latest.rows, positions[idx]);
+      if (r.error) return back(r.error);
+      positions[idx] = r.position;
+    } else {
+      if (positions.length >= myPos.MAX_POSITIONS) return back(`Limit of ${myPos.MAX_POSITIONS} positions reached.`);
+      const r = myPos.buildPosition(body, latest.rows);
+      if (r.error) return back(r.error);
+      positions.push(r.position);
+    }
+    try { myPos.saveMyPositions(MY_POSITIONS_PATH, positions); }
+    catch (e) { return back('Could not save: ' + e.message); }
+    return back(null);
+  }
+
+  if (req.method === 'POST' && url.pathname === '/my-positions/delete') {
+    const body = parseFormBody(await readBody(req));
+    const positions = myPos.loadMyPositions(MY_POSITIONS_PATH).filter(p => p.id !== body.id);
+    try { myPos.saveMyPositions(MY_POSITIONS_PATH, positions); } catch (e) { console.warn('[cde-basis] delete position failed:', e.message); }
+    res.statusCode = 303; res.setHeader('location', '/my-positions'); res.end();
+    return;
+  }
+
+  if (url.pathname === '/api/my-positions') {
+    res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store');
+    const evals = latest ? myPos.rankEvaluated(myPos.evaluateAll(myPos.loadMyPositions(MY_POSITIONS_PATH), latest.rows)) : [];
+    res.end(JSON.stringify({ positions: evals, summary: myPos.summarize(evals) }));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/bidask') {
+    res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
+    if (!latest) { res.end('<p>loading… <a href="/">back to dashboard</a></p>'); return; }
+    try {
+      res.end(await bidAskPageHTML(latest, loadHidden(), (url.searchParams.get('pair') || 'ALL').toUpperCase()));
+    } catch (e) {
+      res.statusCode = 500;
+      res.end(`<p>Bid/Ask page failed: ${e.message}</p>`);
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/quotes') {
+    res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
+    try { res.end(quotesPageHTML(loadHidden(), (url.searchParams.get('pair') || 'ALL').toUpperCase())); } catch (e) { res.statusCode = 500; res.end(`<p>Quote sheet failed: ${e.message}</p>`); }
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/api/quotes') {
+    res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store');
+    res.end(JSON.stringify({ tapeOn: !!tape, params: QUOTE_PARAMS, status: tape ? tape.status() : null, sheet: quoteSheet() }));
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/api/curve') {
+    res.setHeader('content-type', 'application/json'); res.setHeader('cache-control', 'no-store');
+    const root = (url.searchParams.get('root') || '').toUpperCase(), pair = url.searchParams.get('pair') || 'FRONT_PERP', side = (url.searchParams.get('side') || 'BUY').toUpperCase();
+    res.end(JSON.stringify(tape ? tape.curve(root, pair, side, { windowMs: (parseFloat(url.searchParams.get('hours')) || 6) * 3600_000 }) : { error: 'tape off' }));
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/fills.csv') {
+    res.setHeader('content-type', 'text/csv; charset=utf-8'); res.setHeader('content-disposition', 'attachment; filename="cde_sim_fills.csv"'); res.setHeader('cache-control', 'no-store');
+    res.end(fillsCSV());
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/volume') {
     res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
     res.end(volumePageHTML(loadHidden()));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/calibration') {
+    res.setHeader('content-type', 'text/html; charset=utf-8'); res.setHeader('cache-control', 'no-store');
+    try {
+      res.end(await calibrationPageHTML());
+    } catch (e) {
+      res.statusCode = 500;
+      res.end(`<p>Calibration failed: ${e.message}</p>`);
+    }
     return;
   }
 
@@ -1600,26 +2563,58 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ---- Why-did-it-stop diagnostics -------------------------------------------
+// A silent return to the prompt is hard to debug, so say what ended the process.
+function installDiagnostics() {
+  const ts = () => new Date().toISOString();
+  const mem = () => { const m = process.memoryUsage(); return `rss=${(m.rss / 1048576).toFixed(0)}MB heap=${(m.heapUsed / 1048576).toFixed(0)}MB`; };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
+    try { process.on(sig, () => { console.log(`[${ts()}] [cde-basis] received ${sig} (${mem()}), shutting down`); process.exit(0); }); } catch (e) { /* signal not supported on this OS */ }
+  }
+  process.on('uncaughtException', (e) => { console.error(`[${ts()}] [cde-basis] UNCAUGHT EXCEPTION (${mem()}):`, e && e.stack || e); process.exit(1); });
+  process.on('unhandledRejection', (e) => { console.error(`[${ts()}] [cde-basis] UNHANDLED REJECTION (kept running):`, e && e.stack || e); });
+  process.on('beforeExit', (code) => { console.error(`[${ts()}] [cde-basis] event loop became empty (code ${code}, ${mem()}) - nothing left to run`); });
+  process.on('exit', (code) => { console.error(`[${ts()}] [cde-basis] process exiting with code ${code} (${mem()})`); });
+  // Heartbeat so a log shows the monitor was alive, and memory growth over time.
+  setInterval(() => console.log(`[${ts()}] [cde-basis] alive ${mem()} lastError=${lastError || 'none'}`), 10 * 60_000).unref();
+}
+
 async function start() {
+  installDiagnostics();
   console.log(`[cde-basis] port=${PORT} poll=${POLL_MS}ms once=${ONCE} dryrun=${DRYRUN} statsWindowDays=${STATS_WINDOW_DAYS}`);
   console.log(`[cde-basis] alerts: majors=[${alertSettings.majors.join(',')}] majorThreshold=${alertSettings.majorThreshold}% altThreshold=${alertSettings.altThreshold}% (editable at /alerts/settings) telegram=${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? 'configured' : 'NOT CONFIGURED (console-only)'}`);
   console.log(`[cde-basis] log=${LOG_PATH}`);
-  if (fs.existsSync(LOG_PATH)) {
-    const sz = fs.statSync(LOG_PATH).size;
-    if (sz > 50 * 1024 * 1024) {
-      console.warn(`[cde-basis] WARNING: log is ${(sz / 1024 / 1024).toFixed(0)} MB — stats recomputation reloads the full file each poll cycle. Consider rotation (see data/rollup pattern in analysis/cde_viability_logger.js) or run with node --max-old-space-size=8192.`);
+
+  try {
+    const rot = await rotateLogIfNeeded(LOG_PATH, MAX_ACTIVE_LOG_DAYS);
+    if (rot.rotated) {
+      console.log(`[cde-basis] rotated log: kept ${rot.kept} recent polls, archived ${rot.archived} older polls to ${rot.archivePath}${rot.corrupt ? ` (${rot.corrupt} corrupt lines dropped)` : ''}`);
     }
+  } catch (e) {
+    console.warn('[cde-basis] log rotation check failed (continuing anyway):', e.message);
   }
+
   await runCheck();
   if (ONCE) { console.log('[cde-basis] --once: exiting after one poll'); process.exit(0); }
   server.listen(PORT, '127.0.0.1', () => console.log(`[cde-basis] dashboard http://localhost:${PORT}`));
+  if (tape) {
+    console.log(`[cde-basis] shadow P&L: ${shadowLoad()} credited fills reloaded`);
+    tape.loadHistory().then(n => console.log(`[cde-basis] tape ON: sweep ${TAPE_SWEEP_MS / 1000}s, ${n} simulated fills reloaded from ${FILLS_PATH}${TAPE_ROOTS.length ? ', roots=' + TAPE_ROOTS.join(',') : ''}`)).catch(() => {}).finally(() => tape.start());
+  }
   setInterval(() => runCheck().catch(e => console.warn('poll error:', e.message)), POLL_MS);
+  setInterval(warmBooks, Math.round(BOOK_TTL_MS / 2));
+  setInterval(() => {
+    rotateLogIfNeeded(LOG_PATH, MAX_ACTIVE_LOG_DAYS)
+      .then(rot => { if (rot.rotated) console.log(`[cde-basis] rotated log: kept ${rot.kept}, archived ${rot.archived}`); })
+      .catch(e => console.warn('[cde-basis] periodic rotation check failed:', e.message));
+  }, 24 * 3600_000);
 }
 
 if (require.main === module) start();
 else module.exports = {
-  runCheck, buildSnapshot, fetchJSON, server, applyStaleFlags, checkAlerts, lookupZScore,
+  runCheck, buildSnapshot, fetchJSON, server, applyStaleFlags, checkAlerts,
   _setLatestForTest: (s) => { latest = s; },
+  _tapeForTest: () => tape, _quoteSheetForTest: () => quoteSheet(), _fairValueForTest: () => fairValue,
   _setLatestStatsForTest: (s) => { latestStats = s; },
   _resetStaleStateForTest: () => { for (const k of Object.keys(lastMid)) delete lastMid[k]; },
   _resetAlertStateForTest: () => { alertState.clear(); },
