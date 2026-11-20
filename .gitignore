@@ -21,3 +21,4 @@ dbg*.cjs
 debug.js
 data/archive/
 data/*.unreadable-*
+data/*.txt

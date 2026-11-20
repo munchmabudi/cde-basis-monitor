@@ -108,10 +108,11 @@ function createBookFetcher(fetchJSON, opts = {}) {
     }
   }
 
-  function fresh(id) {
+  function fresh(id, maxAgeMs) {
     const hit = cache.get(id);
     if (!hit) return null;
-    const ttl = hit.ok ? ttlMs : (/^HTTP 404/.test(hit.result.error || '') ? notFoundTtlMs : errorTtlMs);
+    let ttl = hit.ok ? ttlMs : (/^HTTP 404/.test(hit.result.error || '') ? notFoundTtlMs : errorTtlMs);
+    if (maxAgeMs != null && hit.ok && !hit.result.stale) ttl = Math.min(ttl, maxAgeMs);   // caller wants a fresher quote than the default TTL
     return now() - hit.at < ttl ? hit.result : null;
   }
   // Last good quote (with how old it is), or null if too old to trust.
@@ -121,8 +122,8 @@ function createBookFetcher(fetchJSON, opts = {}) {
     return { ...g.result, stale: true };
   }
 
-  function one(id) {
-    const f = fresh(id);
+  function one(id, maxAgeMs) {
+    const f = fresh(id, maxAgeMs);
     if (f) return Promise.resolve(f);
     if (inflight.has(id)) return inflight.get(id);
     const p = (async () => {
@@ -148,7 +149,7 @@ function createBookFetcher(fetchJSON, opts = {}) {
   async function getBooks(ids, o = {}) {
     const unique = [...new Set(ids)];
     const out = new Map();
-    const all = Promise.all(unique.map(async (id) => { out.set(id, await one(id)); }));
+    const all = Promise.all(unique.map(async (id) => { out.set(id, await one(id, o.maxAgeMs)); }));
     if (o.maxWaitMs != null) await Promise.race([all, sleep(o.maxWaitMs)]);
     else await all;
     for (const id of unique) {
@@ -317,6 +318,9 @@ function buildBidAskRows(snapRows, books, hidden = {}, nowMs = Date.now()) {
         fundPerCyclePx: (nameB === 'PERP' && r.perp && r.perp.fundingRate != null && legB) ? r.perp.fundingRate * legB.mid : null,
         fundIntervalSec: nameB === 'PERP' && r.perp ? (r.perp.fundingSec || null) : null,
         pairFundAPY: nameB === 'PERP' ? fundAPY : null,
+        // next-funding info for the page (predicted rate if the feed has one, else premium direction)
+        fundInfo: (nameB === 'PERP' && r.perp) ? { fundAPY: r.perp.fundAPY, fundPredAPY: r.perp.fundPredAPY ?? null, fundingPredSrc: r.perp.fundingPredSrc ?? null,
+          premDir: r.perp.premDir ?? null, premDeltaBp: r.perp.premDeltaBp ?? null, premRecentBp: r.perp.premRecentBp ?? null, premPriorBp: r.perp.premPriorBp ?? null } : null,
         fundingEffect,
         netOfFunding: c.bestExecEdge + (fundingEffect || 0),
         spreadBpsA: spreadBps(legA), spreadBpsB: spreadBps(legB),

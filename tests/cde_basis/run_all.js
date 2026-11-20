@@ -1,7 +1,7 @@
 // Runs every CDE basis unit test suite (plain Node, no dependencies):  node tests/cde_basis/run_all.js
 const { spawnSync } = require('child_process');
 const path = require('path');
-const suites = ['test_positions.js', 'test_bidask.js', 'test_fetcher.js'];
+const suites = ['test_positions.js', 'test_bidask.js', 'test_fetcher.js', 'test_fills_quotes.js', 'test_funding.js'];
 let failed = 0;
 for (const f of suites) {
   console.log(`\n=== ${f} ===`);
